@@ -1,0 +1,15 @@
+{
+  "branch": "master",
+  "github": {
+    "url": "https://github.com/EliasKaslan/xmz_dsh.git",
+    "token_file": "D:\\key\\github_PTA.txt",
+    "auth": "token-as-user",
+    "user": ""
+  },
+  "gitcode": {
+    "url": "https://gitcode.com/EliasKaslan/xmz_dsh.git",
+    "token_file": "D:\\key\\gitcode_访问令牌_xmz_agent用.txt",
+    "auth": "user-token",
+    "user": "EliasKaslan"
+  }
+}

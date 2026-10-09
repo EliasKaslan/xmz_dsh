@@ -1,0 +1,82 @@
+# Machine-level patch layer for every dsh profile, applied after the bundle
+# layers and each profile's own cordis.patch.yml.
+#
+# MCP server bridges via the built-in @deepseek-ai/dsh-mcp-client plugin.
+# Tools appear to the model as mcp__<serverName>__<tool> (same shape as
+# Claude Code / Codex). Requires restarting `npx @deepseek-ai/dsh web` to
+# take effect.
+#
+# GitHub MCP: personal access token hardcoded per user request.
+# No env var needed.
+
+- insert:
+    - id: mcp-playwright
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: playwright
+        transport: stdio
+        command: npx
+        args: ['-y', '@playwright/mcp']
+
+    - id: mcp-context7
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: context7
+        transport: stdio
+        command: npx
+        args: ['-y', '@upstash/context7-mcp']
+
+    - id: mcp-sequential-thinking
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: sequential-thinking
+        transport: stdio
+        command: npx
+        args: ['-y', '@modelcontextprotocol/server-sequential-thinking']
+
+    - id: mcp-github
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: github
+        transport: stdio
+        command: npx
+        args: ['-y', '@modelcontextprotocol/server-github']
+        env:
+          GITHUB_PERSONAL_ACCESS_TOKEN: <redacted>
+
+    - id: mcp-memory
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: memory
+        transport: stdio
+        command: npx
+        args:
+          - '-y'
+          - '@modelcontextprotocol/server-memory'
+          - '--env'
+          - 'MEMORY_FILE_PATH=C:/Users/admin/.dsh/mcp/memory.json'
+
+    # Outlook.com (personal MSA) mailbox. Token cache + account selection are
+    # pinned outside %APPDATA% so an npx content-hash change cannot orphan the
+    # session. MS365_MCP_TENANT_ID MUST stay 'consumers': as of June 2026
+    # refresh tokens issued via the default 'common' authority are rejected at
+    # the first refresh, so sessions die roughly an hour after login.
+    # --discovery exposes only 9 tools (~4.4k chars injected); the alternative
+    # --preset mail injects ~273k chars on every request. Do NOT add
+    # ENABLED_TOOLS alongside --discovery: it filters the hidden tool catalog
+    # without shrinking the exposed surface, so tools fail at call time.
+    - id: mcp-outlook
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: outlook
+        transport: stdio
+        command: npx
+        args:
+          - '-y'
+          - '@softeria/ms-365-mcp-server'
+          - '--discovery'
+        env:
+          MS365_MCP_TENANT_ID: 'consumers'
+          MS365_MCP_TOKEN_CACHE_PATH: <redacted>
+          MS365_MCP_SELECTED_ACCOUNT_PATH: 'C:\Users\admin\.dsh\.secrets\ms365\.selected-account.json'
+          MS365_MCP_MESSAGE_SIGNOFF_PREFIX: '🤖 '

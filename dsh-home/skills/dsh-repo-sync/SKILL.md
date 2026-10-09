@@ -1,0 +1,210 @@
+---
+name: dsh-repo-sync
+description: DSH 配置到私仓的确定性同步机制——脚本 sync-dsh-repos.ps1 把 `C:\Users\admin\.dsh` 与编排 preset 用 robocopy 快照进 `D:\repos\deepseek-harness`，排除 sessions/node_modules/.secrets/storages/凭据/zstd，根级 cordis.patch.yml 里的明文 PAT 会被值脱敏成 redacted，运行时不打印令牌，退出码 0/3/4/5/6/7/8，状态与告警落 `sync\state.json`、`sync\ALERT.md`。适用于"手动同步我的私仓 / 现在同步一次 / 同步坏了怎么办 / ALERT.md 出现了 / 昨天同步没成功 / 私仓内容少了或不对 / 计划任务 DSH-Repo-Sync 报错 / 想改同步的排除项"。不适用：向 GitHub 上游仓提 PR → 用 `github-pr-flow`；向 GitCode 社区仓提 PR → 用 `gitcode-pr-flow`。
+whenToUse: 要手动跑一次 ~/.dsh 到私仓的同步、排查同步失败（ALERT/退出码/日志）、或改同步排除项与计划任务时使用。模型看不到本节，触发只靠 description。
+---
+
+# dsh-repo-sync：DSH 配置 → 我的私仓（GitHub / GitCode）
+
+一个**确定性**同步：本机的 DSH 配置（`~/.dsh`）与生效中的编排 preset bundle，双向快照进本机镜像仓
+`D:\repos\deepseek-harness`，再从那里推到两个私仓远端。**没有 shell 里的手工 git 步骤**——
+一切走一个脚本，退出码就是结论。
+
+## 何时调用
+
+**加载本 skill 当：**
+- 用户说「**手动同步我的私仓**」「现在同步一次」「把 ~/.dsh 推到我的仓库」「同步状态怎么样」。
+- 用户说「**同步坏了怎么办**」「昨天/今早的同步没成功」「私仓里的内容少了 / 不对 / 是旧的」。
+- `D:\repos\deepseek-harness\sync\ALERT.md` **存在**（脚本只在失败时写它，成功时删除）。
+- 计划任务 `DSH-Repo-Sync` 报错，或你要重新注册它。
+- 要改**同步范围**（排除项、preset 源、远端 URL、令牌文件路径）。
+
+**不要用本 skill（转交）：**
+- 向 GitHub 上游仓提 PR（DCO / CI 判读） → 用 `github-pr-flow`。
+- 向 GitCode 社区仓提 / 修 PR（门禁、标签） → 用 `gitcode-pr-flow`。
+- 本机 PowerShell 的编码 / 计数 / PS7 语法坑 → 用 `pwsh-on-windows`。
+- skill frontmatter 与 description 怎么写 → 用 `dsh-skill-authoring`。
+
+**前置**：镜像仓 `D:\repos\deepseek-harness` 已 clone（含 `upstream` 远端、分支 `master`）；两个令牌文件存在。 ／ **后继**：修完真跑一次 dry-run，再读 `sync\state.json` 与当月日志确认。
+
+## 1. 机制全景（本 skill 只管这一个机制）
+
+| 项 | 绝对路径 |
+| --- | --- |
+| 同步脚本 | `C:\Users\admin\.dsh\skills\dsh-repo-sync\sync-dsh-repos.ps1` |
+| 镜像仓 | `D:\repos\deepseek-harness`（分支 `master`，`core.autocrlf=false`） |
+| DSH 快照目标 | `D:\repos\deepseek-harness\dsh-home` |
+| preset 快照目标 | `D:\repos\deepseek-harness\dsh-presets\orchestrator-bundle` |
+| preset 源 | `D:\workspace\agent\dsh_base\artifacts\presets\orchestrator-bundle` |
+| 远端配置 | `D:\repos\deepseek-harness\sync\remotes.json` |
+| 运行状态 | `D:\repos\deepseek-harness\sync\state.json` |
+| 日志（按月追加） | `D:\repos\deepseek-harness\sync\logs\sync-YYYY-MM.log` |
+| 告警 | `D:\repos\deepseek-harness\sync\ALERT.md`（**只在失败时存在**） |
+| 排除清单 | `D:\repos\deepseek-harness\sync\EXCLUDED.md` |
+| GitHub 令牌文件 | `D:\key\github_PTA.txt` |
+| GitCode 令牌文件 | `D:\key\gitcode_访问令牌_xmz_agent用.txt` |
+| 计划任务名 | `DSH-Repo-Sync` |
+
+三个**执行阶段**（脚本内顺序固定）：
+
+1. **快照**——`robocopy $DshHome $Snap /MIR /XJ /R:1 /W:1 /NFL /NDL /NP /NJH /NJS /XD sessions node_modules .git .pnpm-store .secrets storages /XF *credentials* *.key *.pem *.token .credentials.yaml *.zstd`；再把 preset 源同法镜像到 `dsh-presets\orchestrator-bundle`（只排除 `node_modules/.git`）。`/MIR` 会**删除目标侧多余文件**，所以目标只允许是上面那两个路径（脚本内有 `Assert-SafeMirrorTarget` 硬校验）。robocopy 退出码 **0..7 视为成功，>=8 才是失败**。
+   - `.secrets` 与 `storages` 是**目录级**排除：前者整个目录都是凭据（`github-pr-flow.token`、`ms365\.token-cache.json`、`ms365\.selected-account.json`），后者是会话项目缓存。这样 `*.token` 匹配不到 `.token-cache.json` 的缺口就被关掉了。
+   - **根级 `cordis.patch.yml` 单独处理**（故意不用 `/XF cordis.patch.yml`——那会连带删掉 `profiles\*\cordis.patch.yml` 与 preset 里的同名文件，它们无密钥且必须保留）：快照完成后先 `Remove-Item $Snap\cordis.patch.yml`，再写 `$Snap\cordis.patch.redacted.yml`——凡是键名匹配 `(?i)(token|secret|password|api_?key|webhook)` 的值一律替换成 `<redacted>`（只动值、保留键与结构、UTF-8 无 BOM），随后**再扫一遍**：只要还能匹配到真令牌字面量就中止（exit 5），绝不把可疑文件留下。
+2. **上游**——`git -C $Mirror fetch --prune upstream master`；有新提交则 `git merge --no-edit upstream/master`；冲突则 `merge --abort` + 写 ALERT + **exit 4**。
+3. **提交与推送**——`git add -A`；无变化且无上游变化且非 `-Force` → 打印 `NO_CHANGE`、写 state、**exit 0（不做空提交、不推送）**；否则提交后对两个远端各推一次 `HEAD:master`。
+
+**鉴权形态（远端实测）**：`remotes.json` 每个远端带 `auth` 与 `user` 两个字段。`auth=token-as-user` → `https://<token>@<host>/<path>`（GitHub 实测可用）；`auth=user-token` → `https://<user>:<token>@<host>/<path>`（**GitCode 只认这一种**：纯 token 形态实测报 `fatal: could not read Password for 'https://<redacted>@gitcode.com': terminal prompts disabled`）。逐字 schema 见 §6。
+
+**非交互与超时（硬）**：每次 git 调用都是 `git -c credential.helper= ...`（**禁用一切 credential helper**），并在脚本开头设 `GIT_TERMINAL_PROMPT=0`、`GIT_ASKPASS=''`。理由：本机 `credential.helper=wincred` 时打 gitcode.com 会**弹 Git Credential Manager GUI 并挂死 120 s**，计划任务会"挂"而不是"失败"。每个 git 调用还有**硬超时**：push 900 s、其余 120 s；超时即杀进程树并按失败处理（push 超时走 exit 6）。
+
+**令牌安全（硬）**：令牌只从 `remotes.json` 里 `token_file` 指定的文件读，`Trim` 掉空白与 BOM；
+**永不打印、永不写进 `.git/config`、永不写进仓库内任何文件**；所有 git 输出先经 `Get-RedactedText`
+（令牌替换为 `<redacted>`，另加 `://user@` → `://<redacted>@` 的正则兜底）。推送用内联 URL，
+不用 `git remote add`——所以 `.git/config` 里没有令牌。唯一例外：`git fetch <内联 URL>` 会把带令牌的
+URL 记进 `.git/FETCH_HEAD`（不在 config 里），脚本在 fetch+merge 之后立刻把它回写成 `<redacted>`。
+
+**DryRun 语义**：镜像到 `%TEMP%\dsh-repo-sync-dryrun\`，**不碰镜像仓、不起任何 git 命令、不写 remotes**；
+连 `EXCLUDED.md` 都写在 TEMP 里。它照样读镜像仓判断存在性、照样报数。
+
+**`.gitignore` 幂等**：脚本只**追加缺失的**行（`sync/logs/`、`sync/state.json`、`sync/ALERT.md`、`sync/.lock`），
+不重复追加、不删原有行、末尾保持 LF。当前 `sync/remotes.json` 与 `sync/EXCLUDED.md` **不在**忽略名单里，
+会被一起提交进私仓——两者都只含路径与字节数，**不含任何令牌值**。
+
+## 2. 退出码表
+
+| 码 | 含义 | 先看哪里 |
+| --- | --- | --- |
+| 0 | 成功推送，或 `NO_CHANGE`（无变化、不提交不推送） | `state.json` 的 `changed` / `remotes[*].ok` |
+| 3 | 环境错误：镜像仓不是 git 仓、`remotes.json` 缺失/坏、或 git 提交身份取不到 | 日志里的 `MIRROR_PRESENT` / `REMOTES_JSON` / `GIT_IDENTITY` 行 |
+| 4 | 上游合并冲突（脚本已 `merge --abort`，镜像仓保持干净） | 日志里 `git merge` 的输出 |
+| 5 | 快照失败（robocopy rc>=8）、提交失败，**或 cordis 脱敏守卫拦下残留令牌** | 日志里 `robocopy ... rc=` / `git commit rc=` / `redaction guard tripped` 行 |
+| 6 | 推送失败（两个远端里至少一个最终没推上去，**含 git 调用超时**） | 日志里 `PUSH[github]` / `PUSH[gitcode]` / `TIMEOUT:` 行 |
+| 7 | 远端分叉（fetch 到远端 master 后 merge 冲突，推不上去） | 日志里 `reconcile merge conflict` / `remote diverged` |
+| 8 | 未预期异常（脚本 bug 或环境突变） | 日志里 `UNEXPECTED:` 那一行 |
+
+**提交身份**：优先用镜像仓的 **local** `user.name`/`user.email`，没有则用 `git config --global` 的值，
+两者都取不到就**不编造**——写 ALERT、**exit 3**。
+
+## 3. 可直接复制的命令
+
+```powershell
+# 手动 dry-run（安全：只写 %TEMP%，镜像仓一字不动，不起 git）
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\admin\.dsh\skills\dsh-repo-sync\sync-dsh-repos.ps1" -DryRun
+
+# 手动真跑
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\admin\.dsh\skills\dsh-repo-sync\sync-dsh-repos.ps1"
+
+# 真跑但跳过上游合并（上游远端暂时不可用时）
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\admin\.dsh\skills\dsh-repo-sync\sync-dsh-repos.ps1" -NoUpstream
+
+# 无变化也强制提交（仅在确实要留一条提交记录时用）
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\admin\.dsh\skills\dsh-repo-sync\sync-dsh-repos.ps1" -Force
+
+# 看日志（当月最后 40 行）
+Get-Content "D:\repos\deepseek-harness\sync\logs\sync-$(Get-Date -Format yyyy-MM).log" -Tail 40
+
+# 看状态（最近一次运行的完整结果）
+Get-Content "D:\repos\deepseek-harness\sync\state.json" -Raw
+
+# 看告警（文件不存在 = 最近一次成功）
+if (Test-Path "D:\repos\deepseek-harness\sync\ALERT.md") { Get-Content "D:\repos\deepseek-harness\sync\ALERT.md" -Raw } else { "no alert" }
+
+# 看被排除清单
+Get-Content "D:\repos\deepseek-harness\sync\EXCLUDED.md"
+
+# 重新注册计划任务（本 skill 不代你注册；注册与否由人决定）
+$act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\Users\admin\.dsh\skills\dsh-repo-sync\sync-dsh-repos.ps1"'
+Register-ScheduledTask -TaskName 'DSH-Repo-Sync' -Action $act -Trigger (New-ScheduledTaskTrigger -Daily -At 09:00) -Force
+```
+
+判读要点：脚本把 `SNAPSHOT_FILES=` / `SNAPSHOT_BYTES=` / `EXCLUDED_ENTRIES=` 打在结尾的 `=== SUMMARY ===` 里；
+`state.json` 的字段是 `last_run_local` / `last_run_utc` / `upstream_head` / `local_head` / `snapshot_files` /
+`changed` / `remotes{ok,pushed_sha,error}` / `exit_code`。
+
+## 4. 故障处置
+
+**上游冲突（exit 4）**——脚本已自动 `git merge --abort`，镜像仓干净。查：`git -C D:\repos\deepseek-harness status`、
+`git -C D:\repos\deepseek-harness log --oneline -5 upstream/master`。修：①若镜像仓的本地提交不要了，就
+`git -C D:\repos\deepseek-harness reset --hard upstream/master` 再真跑；②必须保留本地改动，就在镜像仓里手工 merge
+解决冲突并提交，然后用 `-NoUpstream` 真跑。
+
+**推送被拒（exit 6）**——先看日志里那条 `PUSH[...]`。区分三种：`non-fast-forward / rejected / fetch first`
+= 远端有你没有的提交（脚本已试过 fetch+merge 再推，仍失败才报 6）；`TIMEOUT:` = 该次 git 调用撞到硬超时
+（push 900 s），多半是网络或凭据助手在等你输入——**不是网络慢就是有人把 helper 放回来了**；
+`Authentication failed / 403 / 401` = 令牌或权限问题（见下一条）。探针（**失败时 git 会把带令牌的 URL 打进
+报错里，别把输出粘进聊天/工单**）：
+
+```powershell
+# GitHub（token-as-user 形态，实测可用）
+$t = (Get-Content 'D:\key\github_PTA.txt' -Raw).Trim()
+git -c credential.helper= -C 'D:\repos\deepseek-harness' ls-remote ("https://$t@github.com/EliasKaslan/xmz_dsh.git") HEAD
+
+# GitCode（必须 user-token 形态：用户名 + 令牌作密码；纯 token 形态会报
+#   fatal: could not read Password for 'https://<redacted>@gitcode.com': terminal prompts disabled）
+$g = (Get-Content 'D:\key\gitcode_访问令牌_xmz_agent用.txt' -Raw).Trim()
+git -c credential.helper= -C 'D:\repos\deepseek-harness' ls-remote ("https://EliasKaslan:$g@gitcode.com/EliasKaslan/xmz_dsh.git") HEAD
+```
+
+两条探针都必须带 `-c credential.helper=`，否则本机 `credential.helper=wincred` 会**弹 Git Credential Manager
+GUI 并挂死**（实测 120 s）。
+
+**远端分叉（exit 7）**——脚本 fetch 回了远端 `master` 但 merge 冲突。说明两个私仓/两台机器互相覆盖。
+查：`git -C D:\repos\deepseek-harness log --oneline -10` 与远端 `ls-remote` 的 sha 对比，**先决定以哪边为准**，
+再手工处理。**不要靠 force push 蒙过去**（见 §5）。
+
+**令牌失效 / GitCode 报 `could not read Password`**——症状是 exit 6 + 日志含 `Authentication failed` / `403` /
+`could not read Password`。后者的真因**通常不是令牌坏了，而是鉴权形态用错**（GitCode 必须 `EliasKaslan:<token>@`，
+不能只用 `<token>@`）或某处把 credential helper 放回来了。先核 `remotes.json` 的 `auth` 字段，再重新生成令牌、
+**覆盖同一个文件**（脚本只认路径、不认格式）：GitHub 写回 `D:\key\github_PTA.txt`（PAT，需 repo 写权限）；
+GitCode 写回 `D:\key\gitcode_访问令牌_xmz_agent用.txt`。两个文件 2026-10-09 实测**都存在**。脚本每次运行都从
+文件重读，改完直接真跑即可，不需要重启任何东西。
+
+**根级 `cordis.patch.yml`（含明文 PAT）**——它**不会**进私仓：脚本每次快照后都把它从快照里 `Remove-Item` 掉，
+只留值脱敏过的 `cordis.patch.redacted.yml`（键名匹配 `(?i)(token|secret|password|api_?key|webhook)` 的值 → `<redacted>`），
+并再扫一遍兜底（残留就 exit 5）。**源文件 `C:\Users\admin\.dsh\cordis.patch.yml` 不动**——它是只读输入。
+真要根治，去那个文件里把明文 PAT 换成变量引用；换掉之后快照里就不会再出现它的脱敏副本以外的任何痕迹。
+
+**robocopy 失败（exit 5）**——日志里是 `robocopy dsh-home rc=N` 且 `N>=8`。常见成因：目标文件被占用
+（脚本 `/R:1` 只重试 1 次）、路径过长、磁盘满。查 D 盘余量（2026-10-09 实测**剩 665 GB**），然后直接重跑一次；
+持续失败就找到占用者再跑。注意 `sessions`（DSH 正在写的会话记录）已被排除，所以占用多半来自 `node_modules`。
+
+**确认"到底同步了什么"**——`state.json` 的 `snapshot_files` 与 `EXCLUDED.md` 一起读。2026-10-09 实测口径：
+`~/.dsh` 约 **28,000 个文件 / 7.5 亿字节**，其中**被排除的只有 8 个顶层项**（6 个目录 + 2 个文件），却覆盖了
+**99.8% 的体积**：`launcher\runtime\node_modules` 26,621 个/475 MB、`sessions` 约 670 个/264 MB、
+`storages` 665 个/12 MB、`profiles\*\node_modules`、`.secrets` 4 个/9 KB，加上 `.credentials.yaml` 与
+`skills\ascend-env\credentials.txt`；真正进快照的只有 **80 余个文件 / 约 1.6 MB**
+（`AGENTS.md`、`cordis.patch.redacted.yml`、`skills\**`、`launcher` 顶层 8 个文件等）。**这是正常的**——
+`~/.dsh` 的体积几乎全在 node_modules 与会话记录上，**不要因为"只有 80 个文件"就以为同步坏了**。
+**三个会话记录位置**：`~/.dsh\sessions\`、`~/.dsh\storages\session_projcache\sessions\`、
+`~/.dsh\storages\session_projcache.json`——前两个被 `/XD sessions` / `/XD storages` 整块挡掉。
+
+## 5. 边界（不要做什么）
+
+- **不要绕过脚本手动 force push**（`git push --force` / `-f`）。脚本的推送形态是 `HEAD:master`，被拒时先
+  `fetch` + `merge` 再推，失败还有 ALERT + `state.json` 留痕；force push 会直接抹掉私仓里另一台机器/另一个
+  会话的提交，而且**不留任何记录**，事后无法判断丢了什么。真要强推，先 `git log` 对清两边差异并让人确认。
+- **不要把 credential helper 放回来**：不要在脚本的 git 调用里去掉 `-c credential.helper=`，也不要设
+  `GIT_ASKPASS` 指向某个命令（实测报 `error: cannot spawn cmd / c exit 1: No such file or directory`）。
+  一旦 helper 生效，gitcode.com 会弹 GUI 挂死，计划任务变成"卡住"而不是"失败"。
+- **不要把令牌写进 `.git/config`**：不要 `git remote add` 带令牌的 URL、不要
+  `git config --global url."https://<token>@...".insteadOf`。脚本故意用内联 URL 推送就是为了这个。
+- **不要让任何别的路径当 robocopy 目标**：`/MIR` 删除目标侧多余文件，写错目标 = 删数据。
+- **不要在镜像仓里手工改 `dsh-home` / `dsh-presets`**：下次 `/MIR` 会覆盖，改动来源只有 `~/.dsh` 与 preset 源。
+- **不要删掉 `cordis.patch.redacted.yml` 的生成逻辑**——根级 `cordis.patch.yml` 里是明文 PAT，
+  少了这一步它就会被 `git add -A` 收进提交并推到两个私仓。
+- **不要指望脚本注册计划任务**：它只跑同步；计划任务 `DSH-Repo-Sync` 由人注册（命令见 §3）。
+- **不要在 DryRun 里找推送结果**：DryRun 不起 git、不推送，`remotes` 全 `fail` 是设计如此，不是失败。
+
+## 6. `sync\remotes.json` 逐字 schema
+
+令牌**只以路径形式**出现在这里，文件里不放任何令牌值。`auth=token-as-user` → `https://<token>@<host><path>`；
+`auth=user-token` → `https://<user>:<token>@<host><path>`。`branch` 字段目前只作记录，脚本推送 refspec
+固定为 `HEAD:master`（与本地、与上游一致）。
+
+```json
+{
+  "branch": "master",
+  "github": { "url": "https://github.com/EliasKaslan/xmz_dsh.git", "token_file": "D:\\key\\github_PTA.txt", "auth": "token-as-user", "user": "" },
+  "gitcode": { "url": "https://gitcode.com/EliasKaslan/xmz_dsh.git", "token_file": "D:\\key\\gitcode_访问令牌_xmz_agent用.txt", "auth": "user-token", "user": "EliasKaslan" }
+}
+```

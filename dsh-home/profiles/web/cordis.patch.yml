@@ -1,0 +1,76 @@
+[
+  {
+    "id": "llm-pi-ai",
+    "name": "@deepseek-ai/dsh-llm-pi-ai",
+    "config": {
+      "providers": {
+        "huoshan": {
+          "displayName": "huoshan",
+          "apiKeyEnv": "HUOSHAN_API_KEY",
+          "api": "openai-completions",
+          "baseURL": "https://st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com/v1",
+          "models": [
+            {
+              "id": "glm-5.3"
+            },
+            {
+              "id": "qwen3.8-max"
+            },
+            {
+              "id": "glm-5.3-flash",
+              "name": "GLM 5.3 Flash"
+            },
+            {
+              "id": "deepseek-v4.1-flash",
+              "name": "DeepSeek V4.1 Flash"
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "id": "agent-default-model",
+    "name": "@deepseek-ai/dsh-agent-default-model",
+    "config": {
+      "provider": "huoshan",
+      "model": "deepseek-v4.1-flash"
+    }
+  },
+  {
+    "id": "ui-settings-general",
+    "name": "@deepseek-ai/dsh-client-ui-settings-general",
+    "config": {
+      "welcomeNoticeVersion": "2026-09-28.1"
+    }
+  },
+  {
+    "id": "permission",
+    "name": "@deepseek-ai/dsh-permission-presets",
+    "config": {
+      "presets": {
+        "read-only": {
+          "sandbox": "read-only",
+          "approval": "ask"
+        },
+        "workspace-write": {
+          "sandbox": "workspace-write",
+          "approval": "ask"
+        },
+        "danger-full-access": {
+          "sandbox": "danger-full-access",
+          "approval": "never"
+        }
+      },
+      "defaultPreset": "danger-full-access"
+    }
+  },
+  {
+    "id": "agent-preset-registry",
+    "name": "@deepseek-ai/dsh-agent-preset-registry",
+    "config": {
+      "default": "standard",
+      "selectedDefault": "orchestrator"
+    }
+  }
+]

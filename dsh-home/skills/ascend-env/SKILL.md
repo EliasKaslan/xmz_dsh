@@ -1,0 +1,250 @@
+---
+name: ascend-env
+description: 昇腾 NPU 服务器环境搭建入口总纲（a3=192.168.13.188 默认 / a3b=.190 备用）——**先并行再串行**的 4 lane 编排（CANN 包下载 ∥ conda 建环境 ∥ torch 栈 whl 预下载 ∥ 两仓 clone，barrier 后串行安装），含子代理写盘边界、机器怎么进、三层验收、从 Windows 驱动远端（base64 通道）的硬规则；具体步骤一律在子 skill。适用于"在昇腾机器上装环境 / 怎么并行搭环境省时间 / 下载和编译能不能同时跑 / 什么能并行什么必须串行 / 要不要派子代理去下载 / 不知道该先做哪一步 / 从零搭一套能跑 vllm 的环境 / 机器进不去或 ssh 假死"。不适用：目录与磁盘、模型在哪 → 用 `ascend-server-layout`；装 CANN → 用 `ascend-cann-env`；conda 与 python → 用 `ascend-conda-env`；跑推理 → 用 `ascend-vllm-serve`。
+whenToUse: 昇腾环境从零搭建的编排入口——「哪些步骤能并行 / 先并行后串行的 lane 怎么划 / 子代理边界 / 该按什么顺序调哪个子 skill」看这里；具体步骤在子 skill。模型看不到本节。
+---
+
+# 昇腾 NPU 环境总纲
+
+**这是入口 skill，不是操作手册。** 本文件只负责三件事：**机器怎么进**、**该按什么顺序调用哪个子 skill**、**全局验收与共用硬规则**。具体步骤一律在子 skill 里，别在本文件里找细节。
+
+## 何时调用
+
+**加载本 skill 当：**
+- 要在 `a3` / `a3b` 上从零搭昇腾环境，或不知道先做哪一步、该用哪个子 skill。
+- 要按顺序调度：服务器目录 → CANN → conda → torch_npu → triton-ascend → vllm 安装 → 起服务。
+- 需要全局三层验收（`npu-smi` / `torch.npu.is_available()` / `NPUPlatform`），或要 `ssh` 从 Windows 驱动远端（避免 PowerShell 引号、heredoc 导致的静默失败）。
+
+**不要用本 skill（转交）：**
+- 目录地图、磁盘红线、模型在哪、哪张卡空闲 → 用 `ascend-server-layout`。
+- 装 / 换 / 查 CANN → 用 `ascend-cann-env`；conda 与 python 版本 → 用 `ascend-conda-env`。
+- torch / torch_npu / triton-ascend / vllm-ascend 安装 → 用 `ascend-torch-npu`、`ascend-triton-ascend`、`vllm-ascend-source-install`；起服务跑推理 → 用 `ascend-vllm-serve`。
+- 卡在本机 PowerShell 命令本身的坑（编码 / 计数 / BOM / PS7 语法） → 用 `pwsh-on-windows`。
+
+**前置**：无（本 skill 是入口，先把 §1 的机器访问与 §5 的远端硬规则读掉）。 ／ **后继**：`ascend-server-layout` → `ascend-cann-env` → `ascend-conda-env`。
+
+## 1. 机器与访问
+
+| 机器 | ssh 别名 | 主机名 / 系统 | 角色 |
+|---|---|---|---|
+| `root@192.168.13.188` | **`a3`** | `node-zj-110-132` / Debian 10，256 核 | **默认**（load ~20，稳定，16 die A3） |
+| `root@192.168.13.190` | `a3b` | `zj-131` / Debian 11，64 核 | 备用（load 常年 ~90，ssh 会假死；2026-09-23 曾连续 9 次 `Connection timed out` 完全不可达，**2026-10-08 复核已恢复可达**——同一次复核里免密失效并已重配） |
+
+```bash
+ssh -n -o BatchMode=yes root@192.168.13.188 "hostname; npu-smi info | head -12"   # 免密已配好（2026-10-08 复核），直接用
+```
+
+- **本机没有 `a3` / `a3b` ssh 别名**：2026-10-08 实测 `ssh a3` → `Could not resolve hostname a3`，`~/.ssh/config` 里只有 `Host 192.168.13.188` / `Host 192.168.13.190` 两段（且 `config.bak-20260922` 里也没有别名）。**`a3`/`a3b` 只是文档代称，命令里一律写 IP**；子 skill 正文里若出现 `ssh a3`，按「.188 默认 / .190 备用」换算成 IP（同见 `ascend-vllm-serve` 的前置检查）。
+- 密码 fallback：本 skill 目录的 `credentials.txt`（**2026-10-08 已更新为新密码**；正常情况下用不到，换机器 / 公钥被清时才用）。**「机器可达」≠「免密有效」，两件事分开测**：先 `ssh -o BatchMode=yes`，失败且报 `Permission denied (publickey,password)` 就用密码登进去重装公钥（见 `credentials.txt` 里 2026-10-08 的记录）。
+- **`.190` 的 ssh 假死**：`ssh_dispatch_run_fatal: Connection to 192.168.13.190 port 22: Connection timed out`（卡在 `expecting SSH2_MSG_KEX_ECDH_REPLY`）是 load ~90 导致 sshd 排不上 CPU，**多数情况重试即可，不是宕机**（2026-09-22 实测同一分钟内先连败 6 次、随后连胜 4 次）。排查顺序：`ping` → TCP 22 → 读 sshd banner → 再 ssh。**但 2026-09-23 那次是连续 9 次全败（见上表），别把「重试就行」当成必然。** **2026-10-08 复核：`.190` 一次即通且返回 `zj-131`——当时坏的是免密（`Permission denied (publickey,password)`）而非可达性，用密码登进去把公钥追加回 `authorized_keys` 就恢复了；下次 `.190` 连不上，先分清是「连不上 TCP」还是「连上了但公钥被拒」。**
+- **`.188` 每条 ssh 都会在 stderr 打一行** `/root/.bashrc: line 36: /usr/local/Ascend/ascend-toolkit/set_env.sh: No such file or directory`。这**不是偶发噪声，是真实断链**（2026-09-23 复验：`readlink -f /usr/local/Ascend/ascend-toolkit/latest` 返回空，`latest -> /usr/local/Ascend/cann-9.1.0/cann` 而该目录不存在）。
+  - 影响范围**仅限「默认路径」**：`.188` 真正在用的 CANN 9.1.0 在 `/mnt/share/x00886548/cann/cann_9_1_0`，只要显式 source 它就不受影响；`/usr/local/Ascend/cann-9.0.0/set_env.sh` 是另一套确实可用的旧安装。
+  - **别依赖 `/usr/local/Ascend/ascend-toolkit`**（它只是个兼容软链壳）。修法与判据见 `ascend-cann-env`。
+
+## 2. 子 skill 索引（按搭建顺序；前一层不通不要做后一层）
+
+| 顺序 | skill | 负责什么 |
+|---|---|---|
+| 1 | `ascend-server-layout` | 机器目录地图、模型在哪、磁盘红线、写文件该去哪、现成可复用环境 |
+| 2 | `ascend-cann-env` | CANN 检测 / 安装 / 激活 / 多版本 / 卸载（toolkit+ops+nnal、驱动&Toolkit 合一包） |
+| 3 | `ascend-conda-env` | conda 检测 / 新建 / 激活 / 共享环境规范 |
+| 4 | `ascend-torch-npu` | torch + torch_npu 商发版本安装与 NPU 可用性验证 |
+| 5 | `ascend-triton-ascend` | triton-ascend 安装与验证（与社区 triton 的共存关系） |
+| 6 | `vllm-ascend-source-install` | vllm + vllm-ascend 源码**配对安装**（含 AscendC 算子编译） |
+| 7 | `ascend-vllm-serve` | **起服务 / 离线推理 / 冒烟**、运行时坑、权重准备 |
+
+> 6 与 7 是「vllm / vllm-ascend」这一块的两半：6 管装得上，7 管跑得起来。
+>
+> **注意：下面这张表是「职责索引」，不是执行顺序。** §3 的 4 条并行 lane 是**横切**这张表的：CANN 的下载、conda 的建环境、torch 栈的下载、两仓的 clone 都属于并行段，只有安装才按这张表的层级串行走。
+
+## 3. 执行编排：先并行、再串行（**本套件的默认执行方式**）
+
+**核心原则：把「下载 / 克隆 / 建环境」这类 IO 密集、彼此不写同一路径的动作全部提前并行做掉；只把有真实前后依赖的安装动作留在串行段。** 从零搭一套的墙钟 ≈ `max(各并行 lane) + 串行段`，而不是各步骤之和。**别一条一条顺着 §3.4 跑。**
+
+### 3.1 依赖图与 4 条并行 lane
+
+> **证据边界（别把下面当结论用）**：2026-10-08 在 `.188` 实测的是**各条命令用到的原语**——三个 `curl` 并发 HEAD 都返回 200、curl 7.64 不支持 `--parallel`/`-Z`、raw.githubusercontent 上的 verified commit 可直读、`pip download` + `pip install --no-index --find-links` 往返、`.188` 现成 wheelhouse 解释器可用。**整条链的端到端往返没有跑过**：离线装只验过 `six` 这类纯 py wheel，torch 全家未试；同一 `$WH` 上的并发写、跨 python 版本下载开关、车道 A 的 pip 序列，均在各子 skill 里逐条标了「未验证」。**照做前先按各子 skill 的未验证项决定要不要加冗余。**
+
+```
+P0 现场取数（免密 / df -h / npu-smi）                ← 必做，不占并行额度
+ │
+ ├─ P1 CANN 三个 .run 并发下载 ───────┐
+ ├─ P2 conda 建环境 ─────────────────┤
+ ├─ P3 torch 栈 whl 预下载 ──────────┤  4 条 lane 同时发
+ └─ P4 vllm / vllm-ascend 两仓 clone ┘
+                                     │ barrier：4 条全绿
+                                     ▼
+ S1 CANN 安装：toolkit → source → nnal → ops → import acl
+ S2 torch → torch_npu → triton-ascend（从本地 wheelhouse 离线装）
+ S3 vllm → vllm-ascend（源码装 + 编 AscendC 算子）
+ S4 三层验收（§4）→ `ascend-vllm-serve`
+```
+
+| lane | 干什么 | 落点（写白名单） | 为什么能并行 | 细节在哪 |
+|---|---|---|---|---|
+| **P1** | CANN toolkit / nnal / A3-ops 三个 `.run` 并发下载（≈4.2G，整条流程最大的墙钟项） | `<PKGS>` | 纯网络 IO，三个文件互不相干 | `ascend-cann-env` 坑 11 |
+| **P2** | `conda create -p <ENVP> python=3.12` | `<ENVP>` **+ `$ROOT/conda_pkgs`**（`conda create` 必然写包缓存，见下） | 对 CANN / 网络 / 两仓零依赖 | `ascend-conda-env` 步骤 4 |
+| **P3** | torch+torchvision+torchaudio+torch_npu（**一条命令**）/ triton-ascend 的 whl **预下载到本地 wheelhouse**（**1+1 两组，同一个 `<WH>`**） | `<WH>` | `pip download` 只是下载，**不需要目标 env 存在**——用任意**同 python 版本**的解释器即可（`.188` 现成的 `xmz_0921` 就是 py3.12.14） | `ascend-torch-npu` 步骤 3（torch 栈 + torch_npu）+ `ascend-triton-ascend` 步骤 ⓪（triton-ascend） |
+| **P4** | `vllm` 与 `vllm-ascend` 两仓 clone + 切 tag/commit | `<SRC>` | 两仓互不写同一目录；配对 commit 用 **raw.githubusercontent 免 clone 拿**（实测 200），所以是真并行 | `vllm-ascend-source-install` §1 |
+
+**落点建议（全在 `/home/vllm` 大盘；`/` 上只放小脚本，见 §6）**：
+
+```bash
+ROOT=/home/vllm/x00886548/envbuild        # ← 换成你自己的目录（**别写 `<...>` 占位符，bash 会当重定向报语法错**）
+PKGS=$ROOT/pkgs          # P1
+ENVP=$ROOT/envs/vllm312  # P2
+CPKGS=$ROOT/conda_pkgs   # P2 的包缓存：必须显式改道，否则 conda 会写共享 pkgs_dirs（系统盘）
+WH=$ROOT/wheelhouse      # P3
+SRC=$ROOT/src            # P4
+mkdir -p "$WH"
+echo 'torch==2.12.0+cpu' > "$WH/constraints.txt"   # ★ P3 的唯一写者（车道 A 写 2.10.0+cpu）
+```
+
+- **`constraints.txt` 只在这里写、两个下载组都只读**：它把 torch 的候选集钉成带 local label 的 `+cpu` 版本（PEP 440 语义已实测：`==2.12.0+cpu` 不匹配 PyPI 上的 `2.12.0`、匹配 `2.12.0+cpu`；而 torch_npu 要求的 `==2.12.0` 匹配 `2.12.0+cpu`）。若两组各自 `echo >` 写同一个文件，极端时序下 `pip` 可能读到被截断的空文件 → **约束静默失效**（详见 `ascend-torch-npu` 步骤 3）。
+
+- **P3 的下载解释器必须与目标 env 同 python 版本**，否则 wheel tag 不匹配、离线装不上（目标 py3.12 就用 `xmz_0921`）。要跨版本下载得加 `--python-version/--abi/--platform/--only-binary=:all:`（**未验证**：只用 `six` 这类纯 py wheel 验过这些开关被接受，没验过 torch 全家）。
+- **P2 必须连包缓存一起改道**：共享 `.condarc` 里 `pkgs_dirs` 指向 `/mnt/share/vllm/conda_pkgs`（在系统盘上）。`conda create -p` **只改环境落点、不改包缓存落点**，所以 lane 脚本里要显式 `export CONDA_PKGS_DIRS=$CPKGS`——否则「白名单只给自己那一格」在物理上不成立（详见 `ascend-conda-env` 步骤 4）。
+- **并行只到 lane 这一层**：共享机（2026-10-08 实测 256 核 / load ~277）上再往 lane 里 fan-out 只会互相拖慢。
+
+### 3.2 barrier 与串行段（为什么这几步不能并行）
+
+- **barrier 只有一条**：4 条 lane 全部落地后才进串行段。**判完没完看产物，不看进程**（`ps` 里有 pid ≠ 下载成功）。
+- **S1 必须串行**：nnal / ops 要求**同路径 toolkit 已装且已 `source`**（不 source 就装 nnal 直接 exit 4）→ toolkit → nnal → ops 顺序不可换。
+- **S2 必须串行**：`torch_npu` 对 torch 是**精确等值依赖**；`triton-ascend` 会**覆盖** triton 并锁 numpy → 三者顺序不可换。预下载只省"下载慢"，**不改变安装顺序**。
+- **S3 必须串行**：vllm-ascend 要求 vllm 已在环境里，且 `--no-build-isolation` 下要过 vllm-ascend 的 build 依赖校验。
+- **串行段里不要再夹下载**：S2 的安装**推荐** `--no-index --find-links <WH>`，把网络整段从串行路径上摘掉。实测 `--no-index` 下 wheelhouse 里没有的包必然 `No matching distribution found` → 能证明它真断网、不会偷偷回源；**但整条 torch 栈的"下载→离线装"往返只在 `six` 这类纯 py wheel 上验过**（见 `ascend-torch-npu` 步骤 3 的未验证项），所以轮询到缺包时按那里写的在线回退走，别硬扛。
+
+### 3.3 用子代理跑这 4 条 lane（**建议，但边界写死**）
+
+4 条 lane 各派一个子代理，**主 Agent 保留 barrier 与整个串行段的控制权**。委派 prompt 里必须写进去的边界：
+
+- **只做本 lane 的下载 / clone / 建目录**。**禁止**：`pip install`、`conda activate`、`source set_env.sh`、改 `/etc`、改 `PATH`、`rm -rf` 任何非本 lane 目录、杀进程、装系统包。
+- **写盘白名单只给自己那一格**（§3.1 表「落点」列）。要写白名单外的路径 → **停下回报，不要自己扩权**。
+- 回报只要「产物路径 + 体积 + 校验值 + 日志末 10 行」，**不要回贴整段日志**（省主 Agent 上下文）。
+- **没有子代理工具就自己后台化**（脚本名照 §3.1 的 lane 命名，**别写 `<lane>.sh` 这种占位符**——bash 会把 `<` `>` 当重定向，`bash` 转头去读一个叫 `lane` 的文件并 truncate 掉 `.sh`/`.log`）：
+  ```bash
+  setsid nohup bash $ROOT/lane_p1_cann.sh > $ROOT/lane_p1.log 2>&1 < /dev/null &
+  echo $! >> $ROOT/lane_pids        # 记下 pid 到文件，清理只认这份记录（见 `orchestrating-subagents` §7）
+  ```
+- 长任务下发方式见 §5（**base64 通道**，别用管道直推脚本正文）。
+
+> **子代理供给**：下发前在 prompt 里点名让它 `skill` 加载本任务所需的 skill——按该 lane 取：CANN 下载 → `ascend-cann-env`；conda 建环境 → `ascend-conda-env`；torch 栈 whl 预下载 → `ascend-torch-npu`；clone 无 skill；四条 lane 一律再加 `ascend-server-layout` 作写盘白名单；加载不到（工具受限的子代理）就把 `C:\Users\admin\.dsh\skills\<name>\SKILL.md` 路径给它 `read`。机制与判据见 `orchestrating-subagents` §3.1。
+> 并发成员 ≥2 或子任务 ≥3 时，按 `orchestrating-subagents` §9.1 在本轮 cwd 落 `.dsh-run\<日期>-ledger.md` 台账，收尾清空。
+
+**lane 完成判据（看产物）**：
+
+```bash
+ls -l $PKGS/*.run                                     # P1：三个 .run 体积对上，两个 md5 对已记录值
+$ENVP/bin/python -V                                   # P2：env 能跑
+ls $WH | grep -E '^(torch|torch_npu|torchvision|torchaudio|triton|triton_ascend)-'   # P3：目标 whl 名齐全
+git -C $SRC/vllm-ascend log --oneline -1; git -C $SRC/vllm log --oneline -1          # P4：HEAD 是目标 commit
+```
+
+### 3.4 串行顺序（与并行段衔接；前一层不通不要做后一层）
+
+1. **P0：进机器、看目录与磁盘** → `ascend-server-layout`（先知道模型在哪、能往哪写）
+2. **CANN** → `ascend-cann-env`（**下载属 P1，安装属 S1**）
+3. **conda 环境** → `ascend-conda-env`（**属 P2**）
+4. **torch 栈**（torch → torch_npu → triton-ascend，顺序不能换）→ `ascend-torch-npu`、`ascend-triton-ascend`（**下载属 P3，安装属 S2**）
+5. **vllm + vllm-ascend** → `vllm-ascend-source-install`（**clone 属 P4，安装属 S3**）
+6. **起服务 / 冒烟** → `ascend-vllm-serve`（**属 S4**）
+
+**已有环境优先复用，别重建**：`.188` 上 `source /mnt/share/x00886548/workspace/batch_inv_qwen35/env_batch_inv.sh` 就能拿到一套已验证的 vllm + vllm-ascend（清单见 `ascend-server-layout`）。
+
+**版本不要纠结**（用户 2026-10-08 定的纪律，细则见子 skill）：torch 栈版本**只参考 vllm-ascend 的 `requirements.txt`**（pin 被注释掉时，注释里保留着原文，直接读注释）；**vllm 的 requirements 不用参考**；装出来有依赖冲突**不用管**（`pip check` 噪音、numpy / fastapi 之类），只要 §4 三层验收过就算成。
+
+## 4. 全局三层验收（逐层来，别一上来就跑模型）
+
+```bash
+npu-smi info | head -12                                    # ① 卡在、驱动在
+python3 -c "import torch, torch_npu; print(torch.npu.is_available(), torch.npu.device_count(), torch.npu.get_soc_version())"   # ② 期望 True 16 253
+python3 -c "from vllm.platforms import current_platform as p; print(type(p).__name__, p.device_type)"                          # ③ 期望 NPUPlatform npu
+```
+
+- ② 的 `253` = A3（soc version），`16` = 16 die。
+- 每层的完整判据、期望值、常见报错见对应子 skill。**②不过就别做 ③**。
+- **完成标记不是证据**（2026-10-08 实测两起）：lane 脚本会打印 `LANE_Px_DONE` / `S4_DONE` 之类标记，**失败也照样打印**。判完成只看**产物**——文件是否存在/大小/条数、日志里有没有 `rc=` 行、验收命令是不是真被执行过。实测两次踩中：P4 的 clone **失败**却仍打印了 DONE；S3 被打断后**标记照打**。
+- **shell 退出码也不可靠时要看产物**：该机器**每次 ssh 都会因 `/root/.bashrc` 里那行失效的 `set_env.sh` 而以 exit 1 结束**（§1），所以 `exit=1` 既可能是真失败、也可能只是这行噪声。判据回到产物本身，不要只看退出码。
+
+## 5. 从 Windows 驱动远端（所有子 skill 共用；违反会**静默失败**）
+
+- **内联 ssh 命令里禁用 `<`、`"`、`$()`**：PowerShell 会解析错误或吃掉内层引号（实测 `grep -E "a|b"` 的引号被剥掉，远端把 `|b` 当成了管道）。**2026-10-08 补机制（本轮复发 6 次，两次据此误判"进程已经死了"）**：本机是 Windows PowerShell 5.1，它会把**单引号内的双引号重新转义成 `\"`** 再交给原生程序，远端 bash 收到的是**字面引号** ⇒ `grep`/`pgrep`/`awk` 的模式**静默零匹配**（看着像"什么都没找到"，其实压根没匹配上），语法错误还会被 `2>$null` 一起吞掉。逐字症状：`bash: -c: line 0: syntax error near unexpected token '('`。**修法**：内联 ssh 只做**无引号的简单命令**（`cat <path>`、`bash /tmp/x.sh`）；凡需要模式匹配的一律 base64 推送 `.sh` 再执行（见下）。
+- 复杂命令一律**本地写 .sh/.py → 用 base64 管道送过去**（2026-10-08 实测改，**取代原来的 `tail -c +4` 直推写法**）：
+
+  ```powershell
+  $f = ".\x.sh"
+  # 必须读**原始字节**：Get-Content -Raw 在 PS 5.1 会按 GBK 解码，含中文的 .sh/.py 会被静默改坏
+  $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($f))
+  ssh root@192.168.13.188 "printf '%s' '$b64' | base64 -d > /tmp/x.sh"
+  ssh -n root@192.168.13.188 "md5sum /tmp/x.sh"    # 与本机 (Get-FileHash -Algorithm MD5 $f).Hash 逐字比对
+  ssh -n root@192.168.13.188 "bash /tmp/x.sh"
+  ```
+
+  - **判据只有一条：`md5sum` 与本地 md5 相同才算推送成功**。md5 不一致时**不要**接着跑——远端那份已经坏了。这条能同时兜住 GBK 改坏、CRLF、截断三种坏法。
+  - **`Get-Content -Raw` 会让"base64 通道"也坏**（2026-10-08 实测）：`Get-Content -Raw` → **GBK 解码** → `UTF8.GetBytes` 重编码，纯 ASCII 脚本侥幸无损，**含中文的脚本会被改坏**——实测 `scripts/strip_torch_pins.py`（中文 docstring）推过去后 `python` 报 `SyntaxError: invalid non-printable character U+E15E`（`閲屽舰濡` 这类 GBK 乱码），且**字节数从 7343 变成 7819**。改用 `[IO.File]::ReadAllBytes` 后 md5 与本地完全一致、`ast.parse` 通过。**凡是 `.py`（docstring/注释多是中文）一律用 ReadAllBytes**。
+
+  - **base64 通道实测逐字无损、且不带 BOM**：含中文 + `%{http_code}` 的脚本往返后远端执行结果与本地一致（`确认 磁盘落点 并行` 原样保留、`%{size_download}` 正常展开）。
+  - **但 base64 会把体积放大 4/3、且整串要塞进 ssh 的命令行**：本机实测过"命令行走长即溢出/截断"（见 `pwsh-on-windows`）。**脚本超过约 20KB 就不要内联**——改用 `scp`（注意本机 `Set-Content -Encoding UTF8` 会带 BOM，要用 `[System.IO.File]::WriteAllText($p,$s,[Text.UTF8Encoding]::new($false))`），或把 base64 按 ~6000 字符分块 append 再校验 `md5sum`。
+  - **不要再无脑加 `tail -c +4`**：本机 `$OutputEncoding` 实测是**无 BOM 的 UTF-8**（`GetPreamble().Length` = 0），管道给 ssh **不注入 BOM** → `tail -c +4` 会**吃掉脚本前 3 个字符**（实测把 `#!/bin/bash` 削成 `bin/bash`；因为接着显式 `bash /tmp/x.sh` 才没报错，改成 `./x.sh` 直接坏）。只有当 `$OutputEncoding` 被显式设成带 BOM 的 `[Text.Encoding]::UTF8` 时才会多出 BOM，那时才需要剥 3 字节——**先探再决定**：
+
+    ```powershell
+    "PROBE" | ssh root@192.168.13.188 "od -An -c | head -1"   # 首字节出现 357 273 277（EF BB BF）= 有 BOM
+    ```
+  - **多行 + 中文的脚本经 PowerShell 管道直推正文会静默损坏**（2026-10-08 实测：同一份脚本直推后远端**丢行**，且 `确认` 变成私用区字符 `U+E1BF U+E17B`，bash 照跑不报错）→ **不要写 `(Get-Content -Raw …) | ssh … "… > /tmp/x.sh"`**，一律走上面的 base64。
+  - `scp` 同样可靠，**但注意本地文件的 BOM**：PS 5.1 `Set-Content -Encoding UTF8` 会写 BOM，scp 会把 BOM 一起带过去 → 远端报 `bash: /tmp/x.sh: line 1: ﻿#!/bin/bash: No such file or directory`。要么用 `[System.IO.File]::WriteAllText($p,$s,[Text.UTF8Encoding]::new($false))` 落本地文件，要么干脆 base64。
+- **heredoc 只在「脚本先落盘、再执行」时可用**。用上面 base64 落盘 + `ssh -n ... "bash /tmp/x.sh"` 的模式下，脚本内的 heredoc（`python - <<'PY'`）**完全正常**，本套件多个 skill 的示例都这么写。
+  **禁止的是把带 heredoc 的脚本直接经 ssh stdin 送进去**（`ssh root@192.168.13.188 "bash -s" < x.sh`、`cat x.sh | ssh root@192.168.13.188 bash`）：heredoc 会与脚本本身争抢 stdin，**永久挂起且不报错**。
+- **`ssh -n` 与「脚本走 stdin」互斥**：`-n` 只用于执行**远端已存在的文件**；任何 `$body | ssh … "… bash -s"` 的写法**绝不能加 `-n`**——stdin 被 `/dev/null` 占掉后脚本空跑且**不报错**，你只会看到输出为空（实测：`ssh -n … "od -An -c"` 读到的是空）。
+- 长任务：`ssh -n root@192.168.13.188 "setsid nohup bash /path/x.sh > /path/x.log 2>&1 < /dev/null &"`，然后轮询日志；别把长任务塞进一条会超时的 ssh。
+- 读远端中文文件/脚本一律显式 UTF-8（`[System.IO.File]::ReadAllText($p,[Text.Encoding]::UTF8)`）；PowerShell 5.1 默认按 GBK 解码，会把中文读成乱码。
+- 需要密码登录时用本机 `python` 的 **paramiko**（已装 5.0.0）非交互式登录，比找 sshpass 可靠。
+- **查「谁占着卡 / 谁占着文件」时，你自己的 ssh 包装进程必然自匹配**：`grep -l <pat> /proc/[0-9]*/cmdline` 这类命令的 cmdline 里就含整条命令串，于是 `bash -c ...` 包装进程会被自己命中，得出**假阳性**。必须再用 `ps -ef | grep -v grep` 与 `ls -l /proc/<pid>/fd/` 交叉复核才能判真占用（实测踩过：一度以为 `pid 140974` 是残留安装进程，实为自己那条 ssh）。
+- **base64 推送后要核对「最终目的地」的 md5，不是 `/tmp` 的**（2026-10-08 实测）：`printf '%s' '$b64' | base64 -d > /tmp/x.sh` 只保证 **`/tmp/x.sh`** 正确。若该脚本本该落在 `$ROOT/`（env 脚本就是这种），只核 `/tmp` 的 md5 会让你**误以为推送成功**——本轮实测 `source $ROOT/env_sv0230.sh` **静默失败**，导致整条 S3 在 **CANN 环境变量未设置**的情况下运行。纪律：写完必须 `md5sum <最终路径>`，与本地 `(Get-FileHash -Algorithm MD5 $f).Hash` 逐字比对。
+- **ssh 里永远不要丢弃 stderr（不要 `2>$null`）**：那会丢掉唯一能解释"进程为什么立刻退出"的 traceback——本轮正是它把 `libhccl.so` 的真因藏了起来。改为 `> x.log 2>&1` 落盘再 `grep`。
+- **重启长任务前先确认旧实例真的死了**：`pgrep -af <name>` 期望输出 `(none)`。本轮出现过**两个同名长任务实例同时写同一个日志文件**，新实例启动时截断了旧文件，据此做出了错误判断（理由：脚本里某段 kill 落在输出被截断处、**实际未生效**）——旧实例还在跑，日志却已经被清空。
+
+## 6. 不要做什么
+
+- **不要按 §3.4 一条一条顺序跑**——那会把 P1~P4 四条本可并行的 lane 串起来，白等 4.2G 的下载与两仓 clone。**先发 lane，再等 barrier**。
+- **不要让两条 lane 写同一个 wheelhouse 的同一组包**：triton-ascend 的 whl 只在 `ascend-triton-ascend` 步骤 ⓪ 下，torch 三件套 / torch_npu 只在 `ascend-torch-npu` 步骤 3 下。
+- **不要给子代理放权**：4 条 lane 的子代理只能下载 / clone / 建目录，**不得 `pip install`、不得 `conda activate`、不得 `source set_env.sh`、不得改 `PATH` 或 `/etc`**（§3.3）。
+- 不要往 `.188` 的 `/`、`/mnt/share`、`/mnt/weight`、`/tmp`、`/root` 写大文件——**这几个路径全都在同一块系统盘上**（`nvme0n1p2`，多租户共用、长期紧张、随时可能被写满）；**大文件与大环境只写 `/home/vllm`**（独立大容量盘）。**本套 skill 一律不记剩余空间数字，动手前自己 `df -h <目标路径>` 现场取数**。详见 `ascend-server-layout`。
+- 不要跳过 CANN 的 `source set_env.sh` 就去装 torch_npu 或编算子。
+- 不要为了排障而 `pip install -U triton`（会覆盖 triton-ascend 的文件，见 `ascend-triton-ascend`）。
+- 不要在共享机器上把 `MAX_JOBS` 打满、或占用别人正在用的卡（先 `npu-smi info`）。
+- **不要把整个 `$CONDA_PREFIX/lib` 加进 `LD_LIBRARY_PATH`**。需要 conda 环境的新版 `libstdc++` 时（`.188` 的 gcc-8 场景），只建一个**只放 `libstdc++` 的 `compat_lib` 目录**前置即可，见 `ascend-torch-npu`。（整目录前置在 `.190` 上有过 `git` 崩的历史记录，2026-09-23 在 `.188` 实测未复现——详见 `ascend-conda-env` 坑 5，别把它当通用结论。）
+- 改动用户环境前先想好回滚路径；破坏性动作（删文件、改 `/etc/Ascend`、强推）先确认。
+
+## 7. 维护记录
+
+- **2026-10-08（第四批：§4 补 2 条判据 + §5 补 3 条硬规则 + 1 处再修正，全部实测）**：
+  1. **新增 §4「完成标记不是证据」**：lane 脚本的 `LANE_Px_DONE` / `S4_DONE` **失败也照打**（实测两起：P4 clone 失败仍打 DONE、S3 被打断后仍打标记）；判完成只看产物（文件存在/大小/条数、`rc=` 行、真跑过的验收命令）。并补「shell 退出码也不可靠」——该机器每次 ssh 都因 `/root/.bashrc` 那行失效 `set_env.sh` 以 exit 1 结束。
+  2. **§5 第一条补全机制**：单引号内的双引号会被本机 PS 5.1 重新转义成 `\"`，远端 bash 收到**字面引号** ⇒ `grep`/`pgrep`/`awk` 模式**静默零匹配**；逐字症状 `bash: -c: line 0: syntax error near unexpected token '('`；本轮复发 **6 次**、两次据此误判"进程已死"。规则收紧为：内联 ssh 只做无引号简单命令，模式匹配一律 base64 推 `.sh`。
+  3. **新增 §5「核对最终目的地的 md5」**：只核 `/tmp/x.sh` 的 md5 会让你误以为推送成功——本轮 `source $ROOT/env_sv0230.sh` **静默失败**，整条 S3 在 CANN 变量未设置下运行；写完必须 `md5sum <最终路径>`。
+  4. **新增 §5「ssh 里永远不要 `2>$null`」**：丢弃 stderr 会丢掉唯一能解释"进程为何立刻退出"的 traceback（本轮正是它把 `libhccl.so` 真因藏起来）；改为落盘再 grep。
+  5. **新增 §5「重启长任务前先确认旧实例死了」**：`pgrep -af <name>` 期望 `(none)`；本轮两个同名实例同写一个日志，新实例截断了旧文件 → 据此误判（脚本里那段 kill 落在输出被截断处、**实际未生效**）。
+  6. **再修正上文第 3 条那处 `VLLM_VERSION` 结论**：它只对仍读取该变量的 vllm 版本成立；vllm `v0.23.0` 上该变量已不被读取，`vllm_version_is("0.23.0")` 不设任何变量本就为 `True`（版本线判定）。
+
+- **2026-10-08（执行方式大改：并行编排 + 下发通道勘误，用户要求"大刀阔斧"）**：把 §3 从「一条条按顺序跑」改成**先并行后串行**的编排——新增 §3.1 依赖图与 P1~P4 四条并行 lane（CANN 三包并发下载 / conda 建环境 / torch 栈 whl 预下载到 wheelhouse / 两仓 clone+切 commit）、§3.2 barrier 与"为什么 S1~S3 必须串行"、§3.3 子代理边界（只下不下、写盘白名单、禁止事项）、§3.4 与子 skill 的衔接；§3.4 末补**版本不纠结**纪律（只参考 vllm-ascend 的 requirements，vllm 的不参考，冲突不管）。
+  - **本次 `.188` 实测取证**（2026-10-08，全部只读或落在 `/home/vllm`）：`pip download -d <wh>` → `pip install --no-index --find-links <wh>` 离线往返**通过**（`OFFLINE_INSTALL_OK six 1.17.0`），且 wheelhouse 里没有的包在 `--no-index` 下**必然失败**（证明真断网）；三条 `curl` 后台 `&` + `wait` 并发**全部 200**；`raw.githubusercontent.com/.../vllm-main-verified.commit` 免 clone 取到 `ced6857af…`（所以两个 clone 能真并行）；`curl --parallel` / `-Z` **不支持**（本机 curl 7.64），`aria2c` / `axel` **不存在**（并行只能 `&`+`wait`）。
+  - **§5 勘误（原规则被证伪）**：旧文写「PowerShell 管道给 ssh 会自己注入 UTF-8 BOM，所以 `tail -c +4` 基本是必需的」——实测本机 `$OutputEncoding` 是**无 BOM UTF-8**（`GetPreamble().Length`=0），管道**不注入 BOM**，`tail -c +4` 会吃掉脚本前 3 字符（把 `#!/bin/bash` 削成 `bin/bash`）；且**多行含中文脚本直推会静默损坏**（丢行 + `确认` → `U+E1BF U+E17B`）。§5 已改为 **base64 通道**并给"先探有无 BOM 再决定剥不剥"的判据。
+  - **第二轮（独立子代理对抗性复核后修的 4 处，全部有实证）**：
+    1. **P3 由 3 组改为 1+1 组**（`ascend-torch-npu` 步骤 3）：原写法把 `torch-npu==2.12.0` 单独发一组且不带 `--no-deps`，而 torch_npu 依赖 `torch==2.12.0` → pip 会从 PyPI 拉**无 `+cpu` 的 CUDA 版 torch（GB 级）**，与坑 1 的 `+cpu` 纪律相反。改为「torch 三件套 + torch_npu **合为一条命令** + `-c constraints.txt`（`torch==2.12.0+cpu`）」。**约束语义已实测**（`packaging`：`==2.12.0+cpu` 不匹配 `2.12.0`、匹配 `2.12.0+cpu`；`==2.12.0` 匹配 `2.12.0+cpu`）；**两个索引已实测**（whl/cpu 只有 `+cpu` 形态、aliyun 只有无 local label 形态）。
+    2. **P2 白名单物理上不成立**（`ascend-conda-env` 步骤 4）：`conda create -p` 只改环境落点、**不改包缓存落点**，共享 `.condarc` 的 `pkgs_dirs=/mnt/share/vllm/conda_pkgs` 在系统盘上 → lane 脚本补 `export CONDA_PKGS_DIRS=$L/conda_pkgs`，并把 `CPKGS` 写进 §3.1 白名单。
+    3. **§3.1 标题把未验证写成结论**：删掉"实测各条命令可用"，改为显式「证据边界」块——实测的是**原语**（并发 curl 200、离线往返只验过 `six`、raw 免 clone 可读），**端到端整链没跑过**；§3.2 的 `--no-index` 也从"一律"降为"推荐 + 缺包按在线回退"。
+    4. 顺手修掉真缺陷：`vllm` 那条 lane 的重定向原先只罩住最后一条命令（`init/fetch` 日志会丢）→ 改为罩整个子 shell；`<你的目录>` 这类占位符在 bash 里是重定向符（照抄即语法错）→ 全部换成可直接粘贴的 `envbuild` 路径。
+    - 另：写进 skill 的 **6 段 lane/串行脚本已逐段 `bash -n` 校验通过**（在 `.188` 上跑，不下载不建环境）。注意 `bash -n` **抓不到占位符类错误**（`<lane>.sh` 语法合法、运行必错），所以占位符要单独清。
+  - **第三轮（第二轮复核的回修）**：
+    5. **`constraints.txt` 改为单一写者**：§3.1 落点块统一 `echo` 创建，两个下载组（torch 栈 / triton）都改成**只读校验**（`[ -s … ] || exit 1`）。原先两组各自 `echo >` 会构成同一文件双写、且把车道 B 的 pin 硬编码进 triton 组（车道 A 会写出错版本约束）；极端时序下 pip 还可能读到被截断的空文件 → 约束静默失效。
+    6. **占位符全族清理**：`<lane>.sh`/`<lane>.log`（§3.3）、`<WORK>`（`ascend-torch-npu` 坑 3）、`<x>`/`<本 skill 目录>`（`vllm-ascend-source-install` §0/§3）、`<name>`/`<user>`（`ascend-conda-env` 步骤 4）全部换成可粘贴的实例值 + 就地警告。并补 §5 的「脚本 >20KB 别内联 base64，改 scp / 分块」。
+    7. **`ascend-torch-npu` 步骤 2 与步骤 4 的 `ENVP` 对齐**：步骤 2 原先建 `torch_test/envs/torch_latest`、步骤 4 却用 `envbuild/envs/vllm312`（线性照抄会装进不存在的 env）→ 统一到 `$ROOT/envs/vllm312`，并补 `CONDA_PKGS_DIRS`。
+    8. 复核确认：①②③ 三项均已真修好；`conda create -p` 只剩 `~/.conda/environments.txt`（几十字节）在白名单外，已就地标注（机制推断、未实测）。
+- **建立（2026-09-23）**：把原 `ascend-vllm-env` 单体 skill **删除并拆为「本总纲 + 7 个子 skill」**——`ascend-server-layout` / `ascend-cann-env` / `ascend-conda-env` / `ascend-torch-npu` / `ascend-triton-ascend` / `ascend-vllm-serve` 六个新建，`vllm-ascend-source-install` 为既有（已同步交叉引用）。旧文件内容按职责重分配，无丢失。
+- 本次新增的实装验证：CANN 全新路径安装（合一包 + 独立 toolkit 包两分支）、torch / torch_npu / triton-ascend 商发版本安装。逐条证据见各子 skill 的「坑与修法」。
+- **2026-10-08 凭据与免密复核**：两台 root 密码换成新值（旧密码已作废，不要再试），新值只写在 `credentials.txt`、**不写进本正文**，并已用 paramiko 实测 AUTH-OK。免密复核：`.188` 直接通过；`.190` **免密失效**（`Permission denied (publickey,password)`，机器本身可达）→ 用新密码把本机公钥追加进 `/root/.ssh/authorized_keys`（5 → 6 行）后 `ssh -n -o BatchMode=yes root@192.168.13.190` 返回 `zj-131` 恢复。同次勘误：**本机并无 `a3` / `a3b` ssh 别名**，已把 §1 的示例改成直连 IP。
+- **2026-10-08（M92 lane：vllm/vllm-ascend 双 v0.23.0 tag + CANN 9.2.0-beta.2 实装，4 处勘误）**：
+  1. **§5 的 base64 示例自己就是坏的**（原样照抄会静默损坏脚本）：`(Get-Content -Raw $f)` 在 PS 5.1 按 **GBK** 解码，含中文的 `.py` 推过去后**字节数都变了**（`strip_torch_pins.py` 7343 → 7819），远端 `python` 报 `SyntaxError: invalid non-printable character U+E15E`（`閲屽舰濡` 类乱码）。已改为 `[IO.File]::ReadAllBytes($f)`，并把「**`md5sum` 与本地 md5 一致才算推送成功**」写成硬判据——这一条能同时兜住 GBK 改坏 / CRLF / 截断三种坏法。
+  2. `ascend-cann-env` 坑 11 的「公开源最高 = 9.1.0，9.2.0-beta.1/2 全 403」**被证伪**：真因是**桶内目录名不是版本号**（9.2.0-beta.2 在 `CANN 9.2.T3/`，按 `CANN 9.2.0-beta.2/` 探才 403）；Referer 头**非必需**。同时**确认「9.2.0 商发公网不存在」这条结论成立**（同目录下 `…_9.2.0_linux-x86_64.run` 403，对照 beta.2 = 200）。
+  3. `ascend-vllm-serve` 坑 4 原写「同理别设 `VLLM_VERSION`」**是错的**：它正是 vllm 版本串非纯 `x.y.z`（脏树 / `VLLM_TARGET_DEVICE=empty` 的 `.empty`）时 `vllm_version_is()` 全线误判的逃生口；不设就崩在 `AttributeError: module 'vllm.v1.engine.utils' has no attribute 'get_physical_gpu_ids_for_local_dp_rank'`。完整机理归 `vllm-ascend-source-install` §5 / §6 坑 10。
+      > **2026-10-08 再修正（本条只对「仍读取该变量」的 vllm 版本成立）**：在 vllm `v0.23.0` 上 `VLLM_VERSION` **已不被 `setup.py` 读取**——`grep -n VLLM_VERSION setup.py` 逐字只剩 `VLLM_VERSION_OVERRIDE` 两行（见 `vllm-ascend-source-install` §5.1）；且**不导任何变量时** `vllm_version_is("0.23.0")` 本来就为 `True`（它是**版本线**判定，不是等值判定）。⇒ 别再把它当"必须 export 的逃生口"；该版本的修法是 `VLLM_VERSION_OVERRIDE` 或核对配对版本。
+  4. `ascend-conda-env` 补 pip 源限速判据：阿里云**只对 HTTP/1.1** 限到 185 KB/s，同 URL `curl`(HTTP/2) 14.2 MB/s、`curl --http1.1` 181 KB/s、`mirrors.huaweicloud.com`(HTTP/1.1) 7.9 MB/s → 「同 URL 三连对照」是定性方法，不是"网慢"。

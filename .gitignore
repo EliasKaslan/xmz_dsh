@@ -46,3 +46,13 @@ worktrees/
 .agents/worktrees/
 .typert-*/
 native/system/test/bin/
+node_modules/
+**/node_modules/
+.pnpm-store/
+dist/
+*.log
+# dsh-repo-sync local state (never published)
+sync/logs/
+sync/state.json
+sync/ALERT.md
+sync/.lock

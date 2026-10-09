@@ -1,0 +1,16 @@
+{
+  "name": "dsh-profile-web",
+  "private": true,
+  "dependencies": {
+    "@local/dsh-orchestrator-preset": "link:D:/workspace/agent/dsh_base/artifacts/presets/orchestrator-bundle"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "@local/dsh-orchestrator-preset"
+      ]
+    }
+  }
+}

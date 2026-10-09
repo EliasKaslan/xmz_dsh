@@ -1,0 +1,9 @@
+{
+  "name": "dsh-launcher-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Managed @deepseek-ai/dsh runtime for the desktop launcher. Do not edit by hand.",
+  "dependencies": {
+    "@deepseek-ai/dsh": "^0.2.0-rc.2"
+  }
+}
