@@ -44,6 +44,7 @@ whenToUse: 要在 GitHub 上游仓库（尤其 vllm-project/vllm-ascend）提交
   $t = (Get-Content "$env:USERPROFILE\.dsh\.secrets\github-pr-flow.token" -Raw -Encoding utf8).Trim()   # 位置与策略见 §0；token 是纯 ASCII，此处只为与全机读写规则一致
   curl.exe -s -D - -o NUL -H "Authorization: Bearer $t" https://api.github.com/user | Select-String 'x-oauth-scopes|^HTTP'
   ```
+- **用同一个 classic PAT 建私仓（本轮实测 201）**：`POST https://api.github.com/user/repos`，body `{"name":"<repo>","private":true}` → **201**，一次成功（40 字符的 classic PAT、`x-oauth-scopes` 含 `repo`）。**判令牌能力只看 `x-oauth-scopes` 响应头**（就是上面那条探测命令），**别靠猜前缀**——`ghp_` 前缀不代表带 `repo`，fine-grained（`github_pat_`）在同类调用上会 403（§0）。建完回读 `GET /repos/:owner/:repo` 确认 `private=true` 与 `default_branch`。
 - **规范调研（必做，决定 commit/PR 格式）**：读上游 `CONTRIBUTING.md`、`AGENTS.md`、`.github/PULL_REQUEST_TEMPLATE.md`，确认：DCO（要 `Signed-off-by:`）、commit 消息格式、PR 标题前缀、PR 模板段落、lint 要求。
 
 ## 2. 克隆与 DCO 提交（PowerShell 三坑）

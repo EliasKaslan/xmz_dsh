@@ -50,8 +50,21 @@ whenToUse: 要手动跑一次 ~/.dsh 到私仓的同步、排查同步失败（A
 1. **快照**——`robocopy $DshHome $Snap /MIR /XJ /R:1 /W:1 /NFL /NDL /NP /NJH /NJS /XD sessions node_modules .git .pnpm-store .secrets storages /XF *credentials* *.key *.pem *.token .credentials.yaml *.zstd`；再把 preset 源同法镜像到 `dsh-presets\orchestrator-bundle`（只排除 `node_modules/.git`）。`/MIR` 会**删除目标侧多余文件**，所以目标只允许是上面那两个路径（脚本内有 `Assert-SafeMirrorTarget` 硬校验）。robocopy 退出码 **0..7 视为成功，>=8 才是失败**。
    - `.secrets` 与 `storages` 是**目录级**排除：前者整个目录都是凭据（`github-pr-flow.token`、`ms365\.token-cache.json`、`ms365\.selected-account.json`），后者是会话项目缓存。这样 `*.token` 匹配不到 `.token-cache.json` 的缺口就被关掉了。
    - **根级 `cordis.patch.yml` 单独处理**（故意不用 `/XF cordis.patch.yml`——那会连带删掉 `profiles\*\cordis.patch.yml` 与 preset 里的同名文件，它们无密钥且必须保留）：快照完成后先 `Remove-Item $Snap\cordis.patch.yml`，再写 `$Snap\cordis.patch.redacted.yml`——凡是键名匹配 `(?i)(token|secret|password|api_?key|webhook)` 的值一律替换成 `<redacted>`（只动值、保留键与结构、UTF-8 无 BOM），随后**再扫一遍**：只要还能匹配到真令牌字面量就中止（exit 5），绝不把可疑文件留下。
+    - **"快照里没有真令牌"的验收配方（③④ 为本轮新增；①② 就是上面两条）**：③ 验收必须**逐字节扫真实令牌字面量**求 **0 命中**——把令牌值从**令牌文件**读进内存（**永不打印、永不落盘**）后对整个快照目录做字节扫描；**别用"看起来像令牌"的正则代替**，那样既漏真值也制造误报。④ **区分"散文里提到 `ghp_` 前缀"与"真令牌值"**：`git grep` 命中前者（skill 正文里讨论 `ghp_` 这类文字）是**正常噪声**，只有后者才算泄漏。
 2. **上游**——`git -C $Mirror fetch --prune upstream master`；有新提交则 `git merge --no-edit upstream/master`；冲突则 `merge --abort` + 写 ALERT + **exit 4**。
 3. **提交与推送**——`git add -A`；无变化且无上游变化且非 `-Force` → 打印 `NO_CHANGE`、写 state、**exit 0（不做空提交、不推送）**；否则提交后对两个远端各推一次 `HEAD:master`。
+
+**镜像仓的一次性建法（Windows 上做"字节保真"镜像：三步顺序不可换，实测）**：
+
+```powershell
+git clone --no-checkout <远端URL> D:\repos\deepseek-harness    # ① 先不检出
+git -C D:\repos\deepseek-harness config core.autocrlf false   # ② 关掉换行改写（必须在 checkout 之前）
+git -C D:\repos\deepseek-harness checkout master              # ③ 再检出
+```
+
+- **顺序为什么不能换**：先 `checkout` 再关 `autocrlf`，工作副本已被写成 **CRLF**，而远端存的是 **LF** ⇒ `git status` 把**全部文件**报成改动，镜像不再字节保真（随后 `git add -A` 会把整棵树的换行差异当成内容改动提交上去）。
+- **为什么必须用仓库级作用域（`--local`，即不带 `--global` / `--system`）**：本机 `core.autocrlf=true` 来自**系统级** `file:D:/tools/Git/etc/gitconfig`，**不是** `~/.gitconfig` ⇒ 只改全局配置管不住它，只有仓库级（默认作用域）能覆盖。一行只读取证（本轮复核）：`git config --show-origin --get-all core.autocrlf` → `file:D:/tools/Git/etc/gitconfig` + `true`。
+- 建完自检：`git -C D:\repos\deepseek-harness status --porcelain` 应为空（工作区与 HEAD 逐字节一致）。
 
 **鉴权形态（远端实测）**：`remotes.json` 每个远端带 `auth` 与 `user` 两个字段。`auth=token-as-user` → `https://<token>@<host>/<path>`（GitHub 实测可用）；`auth=user-token` → `https://<user>:<token>@<host>/<path>`（**GitCode 只认这一种**：纯 token 形态实测报 `fatal: could not read Password for 'https://<redacted>@gitcode.com': terminal prompts disabled`）。逐字 schema 见 §6。
 
@@ -115,7 +128,20 @@ Get-Content "D:\repos\deepseek-harness\sync\EXCLUDED.md"
 # 重新注册计划任务（本 skill 不代你注册；注册与否由人决定）
 $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\Users\admin\.dsh\skills\dsh-repo-sync\sync-dsh-repos.ps1"'
 Register-ScheduledTask -TaskName 'DSH-Repo-Sync' -Action $act -Trigger (New-ScheduledTaskTrigger -Daily -At 09:00) -Force
+
+# 等价写法：schtasks（形态与 dsh-skill-self-audit §5 已实测的那条同构）；/TR 指向 ASCII-only 的 .cmd
+schtasks /Create /TN "DSH-Repo-Sync" /SC DAILY /ST 09:00 /F /TR "C:\Users\admin\.dsh\skills\dsh-repo-sync\run_daily.cmd"
+schtasks /Query /TN "DSH-Repo-Sync" /FO LIST /V
+schtasks /Run /TN "DSH-Repo-Sync"        # 立即触发一次（跑闸门，最便宜的真实验证）
+schtasks /Delete /TN "DSH-Repo-Sync" /F  # 回滚：撤销定时
 ```
+
+**计划任务的硬规则（实测）**：
+
+- **`.cmd` 必须 ASCII-only 且写绝对路径**：`cmd.exe` 用 OEM 代码页（本机 GBK）读 `.cmd`，中文字面量会被拆坏。本 skill 的入口壳就是 5 行：`run_daily.cmd` = `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<...>\sync-dsh-repos.ps1"` + `exit /b %ERRORLEVEL%`，逻辑全在 `.ps1` 里。
+- **`-ExecutionPolicy Bypass` 是承重的，不能省**：本机 `Get-ExecutionPolicy -List` **五个作用域全 `Undefined`**（本轮实测）⇒ 有效策略 `Restricted`，去掉它 `.ps1` 会被直接拦下（`running scripts is disabled on this system`）。
+- **`Last Result` 不能当判据**：本机 `DSH-Skill-SelfAudit` 有**恒 0** 的先例 ⇒ 只看 `Last Result: 0` 会把真失败读成成功（`dsh-skill-self-audit` §验收标准已同步修正为"只认产物"）。**判完成只看产物自身**：本 skill = `sync\state.json` 的 `last_run_local` / `exit_code` + 当月日志尾部 + **`sync\ALERT.md` 是否存在**（**存在 = 上次失败**；它只在失败时写、成功时删除）。
+- **失败必须留下可供 agent 接手的痕迹**：`ALERT.md`（含失败阶段与退出码）就是这条通道——别把"任务历史里看着成功"当结论。
 
 判读要点：脚本把 `SNAPSHOT_FILES=` / `SNAPSHOT_BYTES=` / `EXCLUDED_ENTRIES=` 打在结尾的 `=== SUMMARY ===` 里；
 `state.json` 的字段是 `last_run_local` / `last_run_utc` / `upstream_head` / `local_head` / `snapshot_files` /

@@ -141,7 +141,7 @@ schtasks /Delete /TN "DSH-Skill-SelfAudit" /F # 回滚：撤销定时
 
 ## 验收标准
 
-1. `schtasks /Query /TN "DSH-Skill-SelfAudit"` 显示 `Ready`，`schtasks /Run` 后 `runner.log` 新增一行且 `Last Result: 0`。
+1. `schtasks /Query /TN "DSH-Skill-SelfAudit"` 显示 `Ready`，`schtasks /Run` 后 `runner.log` 新增一行（**判完成只认产物**：`runner.log` 新行 + 报告末行 `AUDIT-STATUS: ...`）。⚠️ **`Last Result` 不是判据**——本机实测该字段有**恒 0** 的先例（本轮复核），拿它当验收会把真失败读成成功；计划任务的注册形态、`-ExecutionPolicy Bypass` 为何承重、失败要留 ALERT 供 agent 接手 → 见 `dsh-repo-sync` §3「计划任务的硬规则」。
 2. 闸门在树刚被改过时**确实**返回 `SKIP_QUIET`（exit 10）且不启动 headless。
 3. `skill_audit_scan.py` 跑完 `scan-*.json` 里 `G.unchanged=True`（跑前跑后指纹相同），且 `D:\workspace\agent\.dsh\skills` 树里没有多出任何文件。
 4. 报告末行是 `AUDIT-STATUS: ...`；`FAIL` 归零；会话 skill 目录里能看到 `dsh-skill-self-audit`。

@@ -372,6 +372,11 @@ git push --dry-run --force-with-lease=refs/heads/<br>:<旧sha> upstream HEAD:ref
   写完后**必须逐个回读校验**：`PATCH` 成功响应的 `milestone` 字段是空的（不代表失败），且 `title` 是否被写坏只能靠回读对比改前快照确认。
 - **辅助函数别 dot-source**：`. .\helper.ps1` 会被执行策略拦下（本机 `Restricted`，通用清单见 `pwsh-on-windows`）→ 把函数**内联进命令**，无需改策略。
 - **函数名别撞内置别名**：`GC` 是 `Get-Content` 的别名、**优先级高于函数**（实测与通用清单见 `pwsh-on-windows`）——用 `Get-GitCodeJson` 之类不冲突的名字。
+- **建私仓（Gitee 风格接口，本轮实测一次成功）**：`POST https://api.gitcode.com/api/v5/user/repos`（凭据用 `private-token` 头或 `Authorization: Bearer`），body `{"name":"<repo>","private":true,"auto_init":false}` → **200**（不是 201）。**建仓响应缺 `default_branch`、也缺权限字段** ⇒ 建完必须回读两步才算建好：`GET /repos/:owner/:repo`（拿默认分支）与 `GET /repos/:owner/:repo/collaborators?per_page=200`（确认自己 `access_level=50` / `role_name=Owner`；`total` 会超一页，分页口径同 §10 表末那条）。
+- **⚠️ git https 传输层鉴权与 API 头鉴权是两套，别互相推**：传输层**只认** `https://<user>:<token>@gitcode.com/<owner>/<repo>.git`；把 token 当用户名（`https://<token>@gitcode.com/...`）**必失败**，逐字原文 `fatal: could not read Password for 'https://<redacted>@gitcode.com': terminal prompts disabled`（同一形态在另一个机制里也有实测记录 → `dsh-repo-sync` §1/§4）。
+- **所有 git 调用都要前置禁用凭据助手**：`git -c credential.helper= ...` + `$env:GIT_TERMINAL_PROMPT='0'`——本机 `credential.helper=wincred` 时打 gitcode.com 会**弹 Git Credential Manager GUI 并挂死**（实测 `ls-remote` 卡满 120 s）。**不要**改用 `GIT_ASKPASS='cmd /c exit 1'` 顶替：实测报 `error: cannot spawn cmd /c exit 1: No such file or directory`。
+- **`ls-remote` 的退出码按"有没有匹配的 ref"读，不按成败读**：空仓（无任何 ref）时 `git ls-remote --exit-code <url>` → **exit=2**（无匹配 ref，**不是失败**）；**鉴权失败是 exit=128 + `fatal:`** ⇒ 先看 stderr 有没有 `fatal:`，别只看非零码。
+- **判据纪律：负控是判据的一部分**——要拿"空仓 exit=2"当结论，**必须配一个负控**：把 token 截短 1 个字符重跑**同一条**调用，必须复现 **exit=128**；否则无法证明那个 exit=2 不是被吞掉的真失败。
 - PR 的 `html_url` 是 `/merge_requests/<n>`（不是 `/pull/<n>`），`number` 与 `iid` 同值。
 - 文档：https://docs.gitcode.com/docs/apis/ （Pull Requests 章节）。
 - **创建跨仓库 PR**（对 MindSpeed-Ops）：
@@ -550,6 +555,10 @@ git push --force-with-lease origin HEAD:refs/heads/<branch>
 | 导出的 diff 被 read 工具判为 binary | 本机 PowerShell 的 `>` 写 UTF-16（见 `pwsh-on-windows`）；**改用 `cmd /c "git grep ... > out.txt 2>&1"` 拿原始 UTF-8 字节**（`\| Out-File -Encoding utf8` 仍带 BOM） |
 | 内容已改却用 `git commit --amend --no-edit` 提交 | message 会留在旧内容上、与实际 diff 矛盾（实测：提交标题仍写"新增英文版OVERVIEW.md"，而该提交已不新增任何英文文件）；内容一变必须 `git commit --amend -m "<新 message>"`，再用 `git rev-parse 'HEAD^{tree}'` 确认 tree OID 未变，然后 `--force-with-lease` + 补发 `compile`（§9.1） |
 | 已直推过的版本分支要回退，想 force-push 抹掉那个直推提交 | **不要改写共享版本分支的历史**：基于它**叠加一个回退提交**再推（实测 `fb09350..05a911c`、exit 0、无需 `--force`）；force-push 会让已 fetch 的人分叉。master 侧未合入的特性分支才可以 `amend` + `--force-with-lease`（强推代价见 §9）；版本分支的既有先例也是叠加修正提交（§12.5） |
+
+| git 报 `fatal: could not read Password for 'https://<redacted>@gitcode.com': terminal prompts disabled` | **鉴权形态错**：git 传输层只认 `https://<user>:<token>@`（把 token 当用户名必失败）；且每次 git 调用都要带 `-c credential.helper=`（否则弹 GCM GUI 挂死）（§7） |
+| `git ls-remote --exit-code` 在空仓/无匹配 ref 时回非零 | **exit=2 = 无匹配 ref，不是失败**；鉴权失败是 **exit=128 + `fatal:`**。要把它当结论必须配负控：token 截短 1 字符重跑须复现 exit=128（§7） |
+| 要建 GitCode 私仓 | `POST https://api.gitcode.com/api/v5/user/repos`、body 含 `"private":true` → **200**；响应**缺** `default_branch` 与权限字段 ⇒ 必须回读 `/repos/:owner/:repo` 与 `/collaborators?per_page=200`（`access_level=50`）（§7） |
 
 ## 11. 浏览器共享注意事项
 
