@@ -16,6 +16,7 @@ whenToUse: 要改 DSH 自身行为（行为宪法 / 流程 skill / agent 组合 
 - 触发信号：host 起了但页面打不开、改了配置不知何时生效、改完想回滚。
 - 触发信号：要挂一个实验包 / 官方 bundle 进 profile，或要判断"手工 row / 空 patch 前提的脚本今天还管不管用" → 读 **2.11**；要看那个包的策略文本为什么是英文、README 指的文件为什么找不到 → 见「不要做什么」末两条。
 - 触发信号：文件被**覆盖 / 没备份**，要问"会话日志里能不能找回旧版本""文件被覆盖了怎么恢复""`session.v4.jsonl.zstd` 怎么解压" → 读 **2.12**。
+- 触发信号：用户说"本轮运行失败""这次 turn 挂了""某个报错在历史上出过几次""把这个错误码全库扫一遍" → 读 **2.12** 的**全库扫描配方**与 **2.17**（`Provider finish_reason: <X>` 的溯源链与"是不是 DSH 的 bug"判据）。
 - 触发信号：要改"新会话的默认 preset"，或**正在运行的 host** 上改完 preset registry 那一行后**工具面只剩 MCP 工具**、再改回去也不恢复 → 读 **2.13**（正确字段是 volatile 的 `selectedDefault`；热改这一行的 `config` 会让**已存在会话**当场崩塌且**不自愈**，只有重启进程能恢复）；报错 `Config field "default" is not volatile` 或 `... is overridden by a home patch or command-line overlay` 也是 **2.13**。
 - 触发信号：你正要跑 `dsh_base\tools\sync-to-dsh-home.ps1` / `tools\check-drift.ps1`，或要问"`config\` 里这份快照还是不是真快照""`-Apply` 会不会把 live 覆盖回去""重建 home 是不是跑一次 `-Apply`" → 读 **2.14**（池是**分发源**不是回滚库；`-Apply` 会静默回退 `AGENTS.md`，动手前先做方向裁定）。
 - 触发信号：你要**清理 / 整理 `~/.dsh/skills` 根**（移 `.bak` 之类残留、给 skill 目录瘦身），或看到 `credentials` / `.key` / `.pem` / `.token` 这类文件不知能不能移 → 读 **2.15**（被 skill 正文引用的凭据**就地保留**；移走 = 假指针 + 可能推翻用户决策）。
@@ -263,6 +264,35 @@ whenToUse: 要改 DSH 自身行为（行为宪法 / 流程 skill / agent 组合 
 
 > 会话 id / 隔离 home 路径等属**会话专属证据**，留报告，不进本 skill。
 
+### 2.12.1 全会话扫某个错误串的复现配方（zstd 流式精确匹配）
+
+**要回答"这个报错在本机历史上出过几次、命中哪些会话"** 时用它。会话文件散布在 `C:\Users\admin\.dsh\sessions\<工作区转义名>\<agentId>\` 下，名字有 `session.jsonl.zstd` / `session.v3.jsonl.zstd` / `session.v4.jsonl.zstd` 三种以上 ⇒ **按扩展名 `.zstd` 全树扫**最稳，别按文件名猜。
+
+**必须用精确 JSON 模式匹配**：`content_filter` 这类子串会在**排查会话自己的正文里**反复出现（本轮实测：子串命中 49 行，其中 **39 行**是排查会话里的普通文本巧合）⇒ 裸子串计数会把"我自己的排查过程"当成事件数。
+
+```powershell
+$code = @'
+import os, zstandard
+d = zstandard.ZstdDecompressor()
+for dp, _, fn in os.walk(r"C:\Users\admin\.dsh\sessions"):
+    for f in fn:
+        if f.endswith(".zstd"):
+            p = os.path.join(dp, f)
+            lines = d.stream_reader(open(p, "rb")).read().split(b"\n")
+            for i, l in enumerate(lines, 1):
+                if b'"Provider finish_reason: content_filter"' in l:
+                    print(p, i, len(lines))
+'@
+$code | python -X utf8 -
+```
+
+- **匹配用 bytes 字面量**（`b'"…"'`）而不是子串技巧：抓的是日志里那个**带引号的 JSON 字段值**，这正是"精确模式"的落地方式。
+- **必须流式**（`stream_reader`）：会话日志是**多帧拼接** zstd，单帧 API 只回第一帧且不报错（假否定，逐字配方与证据 → `pwsh-on-windows` 陷阱表"多帧拼接 zstd"行）；`stream_reader` 顺带满足**不落盘**。
+- **事件计数判据：行数 ÷ 2 = 事件数**——真实事件在一条 `assistant/attempt` 里**成对出现**（`finish` chunk 行 + 紧随的 `turn/end` 行）⇒ 别把命中行数直接当次数报。本轮实跑：**677 个文件 / 264,383,956 B → 10 行 / 5 事件 / 4 会话**。
+- **依赖**：python 的 `zstandard` 模块（无它直接 ImportError）。**本机 zstd 会话合计约 260 MB 量级**（时刻值）⇒ 耗时在解压、不在匹配。
+- **坑**：别用 `d.decompress(b)`（单帧，多帧文件只有第一帧）；别按文件名（`session.v4.jsonl.zstd`）找，要按扩展名扫；别忘"÷2"。
+- 本节的**下游**：拿到命中的会话后再判"这错误是不是 DSH 的 bug"→ 见 **2.17**（错误串的实装链路行号**单一归属在 2.17**，本节只写扫描配方、不复制链路）。
+
 ### 2.13 改"正在运行 host"的 registry 行：已存在会话的工具面**当场静默崩塌**（实测，全库最隐蔽的一种）
 
 **这是与 2.1 相反方向的坑**：2.1 的坏 row 是"**当场无感、重启才死**"；本节是"**当场就坏、重启才活**"。
@@ -442,6 +472,38 @@ Get-ChildItem 'C:\Users\admin\.dsh\skills' -Recurse -File |
 
 > **锚点会漂，靠名字找回来**：上面每个源码位置都同时给了**函数名 / 常量名**（`view(scope)` / `admits` / `installScoped` / `SUBAGENT_DELEGATION_CONTEXT`）而不只是行号，行号漂了还能按名字定位（同 §2.15 口径）。`dsh-tools:2888-2894` 的注释与实现不符**本轮不改源码**（不在写域内），只在此登记——如需上游修注释，另派。
 
+### 2.17 「本轮运行失败」+ `Provider finish_reason: <X>`：透传 / 可重试 / 致命三分，以及"是不是 DSH 的 bug"判据
+
+> 承接 **2.12.1**（扫出错误串之后怎么判读）。本节只写**判据与实装链路**，不写扫描配方。
+
+**先拆掉最容易被误读的一层：那句报错文字不是 DSH 的判定。** 用户可见的
+
+```
+本轮运行失败
+Provider finish_reason: content_filter
+```
+
+是 **UI 的 i18n 标题 + 上游字段透传**——`"message.turnError": "本轮运行失败"`（英文 `"This turn failed"`）在 `node_modules\@deepseek-ai\dsh-client-ui-chat\lib\client.js:5526`（英文 `:5715`）。**"本轮运行失败"是界面文案，"Provider finish_reason: …" 是上游给的** ⇒ 报告这类问题时不要把两句一起当成"DSH 崩了"的证据。
+
+**实装位置（唯一权威）**：`C:\Users\admin\.dsh\launcher\runtime` 的 `node_modules`。**`D:\workspace\agent\dsh_base` 不是 DSH 源码树**（只有 `artifacts/` 与备份）⇒ 在那里找不到实现，**别在错的地方读源码**。
+
+**链路四跳**（每一跳都给 `文件:行号` + 可搜的名字）：
+
+1. `node_modules\@earendil-works\pi-ai\dist\api\openai-completions.js:1190-1212` 的 `mapStopReason()`——**错误字符串在这里生成**：`:1202-1203` `case "content_filter"` → `{ stopReason:"error", errorMessage:"Provider finish_reason: content_filter" }`；`:1204-1205` `network_error` 同形；`:1206-1210` `default` → `Provider finish_reason: ${reason}`（**别忘 default 分支：任何没被枚举的上游 reason 都从这儿出**）；`:1197-1198` `length` → **非错误**（UI 显示的是"已达到输出 token 上限"）。⇒ 报错里那个 `<X>` 就是**上游 worker 的 `finish_reason` 原样**。
+2. `node_modules\@deepseek-ai\dsh-llm-pi-ai\lib\index.js:1380-1391` `classifyPiAiError()`——**没有 `content_filter` 分支** ⇒ 落到 `:1390` `return "PI_AI_ERROR"`。⚠️ `:1389` 会把含 `network|connection|socket|fetch|ECONN*` 的文本判成 `TRANSPORT`（**这决定下一步它可不可重试**）。
+3. `node_modules\@deepseek-ai\dsh-llm\lib\types\retry-policy.js:16-22` 默认重试码 = `EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT`。**`PI_AI_ERROR` 不在内**。
+4. `node_modules\@deepseek-ai\dsh-llm-retry\lib\index.js:160` ⇒ 不在集合内 ⇒ **不进退避、直接放行**（把错误抛给上层）。只有把策略显式配成 `mode: "always"` 才会**无条件重试**。
+
+**判据（可迁移，换任何错误串都照做）**：**报错字符串里带着上游的 `finish_reason` ⇒ 先怀疑上游、而不是 DSH**。三步判定动作：① 在 **runtime** 的 dist 里 grep 这个字符串（找到"是谁生成它"的那一跳）；② 读 `classifyPiAiError()` 有没有**为该类错误开专门分支**（没开 = 归 `PI_AI_ERROR` / 跟 `network|connection|socket|fetch|ECONN*` 沾边的会被误判成 `TRANSPORT`）；③ 查该 code **在不在 `retry-policy.js` 的重试集合里**。**三条一起看才能判"透传 / 可重试 / 致命"**——只看报错文字得不出任何一条。
+
+**已知真实形态（本机实测，属证据不属结论；别再当成"上下文超长"）**：多次事件里模型**已经产出数百到数千个输出 token** 后上游才给 `content_filter`（**输出侧过滤**）；也出现过**第 1 轮第 1 步、usage 全 0、模型只吐一句拒绝语**（**输入侧 / 网关兜底**）。⇒ **与"上下文超长"无关**（命中的 prompt 都小于该模型 `contextWindow`），也**与"会话有多长"无关**。**附带结论**：`content_filter` 归为**不可重试的致命错误** ⇒ 已生成的输出被**整个丢弃**、**无降级、不换模型**——这是**健壮性设计取舍**，不是"报错了"的 bug。
+
+**不要做什么**：① 不要在 `D:\workspace\agent\dsh_base` 里找这段实现（它只有 artifacts）；② 不要把 `length`（`mapStopReason` 的 `:1197-1198`）判成错误并写进排查清单（UI 文案完全不同）；③ 不要只 grep 第二跳就下结论——**没有专门分支**是判"不可重试"的**必要条件之一**，还得看第 3、4 跳。
+
+**验收标准**：能一句话说出这个错误串是**谁生成的**（文件:行号）+ **归到哪个 code** + **在不在重试集合里** + **会不会丢弃已生成输出**。四条都答得出才算判完。
+
+
+
 ## 3. 阶梯顺序（编排入口）
 
 ```
@@ -486,3 +548,4 @@ Get-ChildItem 'C:\Users\admin\.dsh\skills' -Recurse -File |
 3. 若动的是自己正跑着的 host：看门狗**已用人为杀 host 实测过**回滚与重启分支，且重启命令显式带 `DSH_HOME` / `--port` / `--no-open`，marker 文件已落盘。
 4. 按第 3 节阶梯留下证据：离线校验结论 → 隔离 host 就绪（401）→ 在线 `agentPreset`/persona/工具/`turn/end` → 上线后的冷启动证据。
 5. 子 skill 与总纲的交叉引用双向齐全（总纲 → 子 skill；子 skill description 的"不适用 → 用 `dsh-agent-customization`"）。
+6. 遇到"本轮运行失败 / `Provider finish_reason: <X>`"这类报错时，能按 **2.17** 说出**谁生成它（文件:行号）／归到哪个 code／在不在重试集合里／会不会丢弃已生成输出**——四条答不全就说明还没判完。

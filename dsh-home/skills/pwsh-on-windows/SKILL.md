@@ -104,6 +104,7 @@ whenToUse: 本机用 pwsh 工具跑命令、读写文件、统计行数/字符/C
 | **`$host` 是只读自动变量，赋值直接抛错** | `$host` 是 PS 内置的 `InternalHost` 对象，不是普通变量 | 逐字原文：`无法覆盖变量 Host，因为该变量为只读变量或常量` | 自己的变量别叫 `$host`（改名 `$xHost` / `$target`）。**更要命的是连带效应**：赋值一失败，后续 `$host.Substring(...)` 之类会在**另一个对象**上执行，得出**看起来像结论**的假结果（本次实测：拿 `$host` 存文件路径，导致整个哈希对比结论作废）⇒ **关键校验里的路径 / 哈希变量要用不可能撞名的名字** |
 | **`(名字 = 值)` 写进子表达式 → 被当命令执行** | `( ... )` 里 `名字 = 值` **不是赋值语句**，PS 按**命令**解析，于是去 PATH 里找一个叫 `SHA256` 的命令 | 逐字原文（`(SHA256 = (Get-FileHash $p -Algorithm SHA256).Hash)`）：`无法将"SHA256"项识别为 cmdlet、函数、脚本文件或可运行程序的名称。请检查名称的拼写，如果包括路径，请确保路径正确，然后再试一次。` + `[exit code: 1]` | 赋值写成**独立语句** `$x = ...`；要在**一行**里取值就用字符串拼接 `"SHA256=" + (Get-FileHash $p -Algorithm SHA256).Hash` |
 | **多帧拼接 zstd（如 DSH 会话日志 `session.v4.jsonl.zstd`）用单帧 API 解 → 只回第一帧、静默少数据**（**不报错**，所以你不会去查它） | 这类文件是**多个 zstd 帧首尾拼接**（每帧以 magic `28 B5 2F FD` 开头），单帧 API **解完第一帧就返回**、不提示还有后续帧 | Node v24.18.0 实测：**174,301 B 的文件 `zstdDecompressSync` 只回 289 B**（`createZstdDecompress` 流式同 289 B）；按 magic 切帧后 **79 帧 / 927,790 B**。**判据：解出字节数 << 文件大小就是踩了这个坑**（289 vs 174,301） | 按 magic `28 B5 2F FD` **切帧逐帧解再拼**（最后一帧可能被写入过程截断 ⇒ 单帧异常要容忍跳过），或用 Python `zstandard` 的 **`stream_reader`**（**别用 `d.decompress(b)`**）；**逐字可抄命令与取证配方 → `dsh-agent-customization` §2.12** |
+| **双引号 here-string `@"…"@` 里喂 python 代码 → 内层 `\"` 被当成字符串终止符，解析期就崩（一行都不执行，等于假通过）** | **PS 的转义符是反引号，不是 `\"`**（同表"`\"a\\\"b\"` 这类转义"行）⇒ here-string 里 `print("a\"b")` 的 `\"` 被当作**字符串结束**，后面的内容成了裸词；**属解析期错误**，`try/catch` 抓不到、**整段脚本一行都不执行** ⇒ 「没报错」与「跑过了」在这里不是一回事 | 逐字原文（子代理实测报告）：`The string is missing the terminator: ".` ／ `Missing type name after '['.` | **把双引号 here-string 换成单引号 here-string 再管道喂 stdin**（本轮亲测可用）：<br>`$code = @'`<br>`print("a\"b")`<br>`'@`<br>`$code \| python -X utf8 -`<br>⚠️ **`@'` 之后必须立刻换行**（`@'…'@` 中间那行是内容、第一行不能有任何字符），否则 here-string 本身起不来。**不要**把它当"UTF-8 编码问题"——是**引号终止符**问题，改编码无用。**附带**：PS 5.1 对原生命令的 stderr 会报 `NativeCommandError` 且 `exit=1`（同表"原生程序的进度信息走 stderr"行），但 **stdout 完整** ⇒ 用 `2>&1 \| Out-String` 收全，**别据此判命令失败**（判据看 stdout 内容 / Python 侧自己写的退出码） |
 
 ## 可抄的正确写法
 
@@ -121,6 +122,13 @@ cmd /c "git grep -n pattern > out.txt 2>&1"
 
 # 给 node 内联传含双引号的 JS：--% 之后是字面量，必须压成单行（裸 -e 会被剥引号）
 node --% -e "console.log(JSON.stringify('a\"b'))"   # 实测输出 "a\"b"，exit 0
+
+# 要喂多行代码给 python（含 \" 的也安全）：一律用【单引号】here-string 管道进 stdin
+# （双引号 @"…"@ 里内层 \" 会被当成字符串终止符 → 解析期错误、整段脚本一行不执行）
+$code = @'
+print("a\"b")
+'@
+$code | python -X utf8 -        # 本轮实测可用；@' 之后必须立刻换行
 
 # 数 CR / 判换行（不要用管道）
 $bytes = [IO.File]::ReadAllBytes($p)

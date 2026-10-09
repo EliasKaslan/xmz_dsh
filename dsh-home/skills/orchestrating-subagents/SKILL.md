@@ -481,14 +481,27 @@ import vllm_ascend    : ModuleNotFoundError                           → 正常
 **配方（两条，缺一不可）**：
 
 1. **下发前显式列名单**：把各 prompt 的写域**逐条枚举**成路径清单，**别只写目录**——写目录时**不存在的文件不会被点名**，漏的正是第 5 个这种"写域里新加、转眼就忘"的条目。
-2. **下发前后各 diff 一次，差集必须为空**（判 **`<=`** 侧——**已实测**：`$scope` 在前时 `<=` = 在写域里、却不在备份集合里；判错侧会**永远空输出** = 假"全备好了"）：
+2. **下发前后各 diff 一次，差集必须为空**。**三条硬要求**：① `$bak` 必须指向**真实写过的落点**（本仓两处实测：`<cwd>\.dsh-run\backups\` 与 `artifacts\backups\`），**不许留一个未核对的前缀当示例**；② **diff 之前先加"glob 匹配到东西"的护栏**；③ 比对按**类名**（`SKILL.md` 取**父目录名**，其它取文件名去扩展名），**别拿 `SKILL.md` 当名字**——备份名是基于**类名**的：
 
    ```powershell
-   $scope = @('C:\Users\admin\.dsh\skills\orchestrating-subagents\SKILL.md')   # = 各 prompt 写域并集（逐条路径，不写目录）
-   $bak   = Get-ChildItem "$env:TEMP\bak-*" | Select-Object -ExpandProperty FullName
-   # 位置参数：第 1 个 = -ReferenceObject($scope)、第 2 个 = -Difference($bak)
-   Compare-Object $scope $bak | Where-Object SideIndicator -eq '<='   # 有输出 = 有写域没备份，别派发
+   $bakDirs = @((Join-Path (Get-Location).Path '.dsh-run\backups'), 'D:\workspace\agent\dsh_base\artifacts\backups')  # 换成你真实写过的落点
+   $scope   = @('<写域并集：逐条完整路径>')                                    # 各 prompt 写域并集（逐条路径，不写目录）
+   $bakNames = @(); foreach ($d in $bakDirs) { foreach ($o in (Get-ChildItem ($d + '\*.bak') -EA SilentlyContinue)) { $bakNames += $o.Name } }
+
+   # 护栏：glob 没匹配到 ⇒ 这不是"全都没备份"，别下结论（否则 $bak 为空会把每个写域文件都报成漏备）
+   if (@($bakNames).Count -eq 0) { Write-Host "GLOB_MATCHED_NOTHING - 别下结论，先修 glob/落点"; return }
+
+   foreach ($f in $scope) {
+     $cls = if ($f -like '*\SKILL.md') { Split-Path -Leaf (Split-Path -Parent $f) } else { $f -replace '.*\\','' -replace '\.[^.]+$','' }
+     $hit = 0; foreach ($b in $bakNames) { if ($b.StartsWith($cls)) { $hit++ } }
+     if ($hit -eq 0) { "LEAK: $f  (class=$cls 无任何 .bak)" }        # 无输出 = 差集为空 = 可以派发
+   }
    ```
+
+   - **「`$bak` 为空」与「写域漏备」是两件事**：两者都表现为"有输出"，不加护栏时前者被静默显示成后者（每次假警报 ⇒ 判据失效，比没有配方更坏）。
+   - **判据要能区分"glob 没匹配到"与"真的漏备"**：前者走 `GLOB_MATCHED_NOTHING` 分支、后者走 `LEAK:` 分支。
+   - **前缀判据的前提**：备份名以**源文件类名**开头（本仓三种命名都满足：`<类名>.<日期>.bak`、`<类名>.POST-EDIT-<日期>.bak`、`<类名>.SKILL.md.pre-<日期>.bak`）。**契约不同就得改判据**，否则会报假漏备。
+   - **实测（本机）**：`orchestrating-subagents` hits=2、`pwsh-on-windows` hits=1、`sedimenting-skills` hits=0（真漏备，与事故记录一致）；用 `SKILL.md` 当名字则**全部 hits=0**（假警报）。
 
 **只记字节数 + sha256 不算备份**：那是**回滚判据的下限**，**不是"能差分"的前提**（同族：`§9.7` 禁止拿估量当判据；`§9.8`"没有回滚路径就别开始"）。
 **不要指望子代理替你留副本**：本轮实测，子代理在**没有池外写权限**时不会自己留，它明确报告"**未落备份副本，写域只授权这两个文件**"
