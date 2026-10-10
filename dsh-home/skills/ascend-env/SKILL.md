@@ -163,8 +163,11 @@ python3 -c "from vllm.platforms import current_platform as p; print(type(p).__na
 
 - ② 的 `253` = A3（soc version），`16` = 16 die。
 - 每层的完整判据、期望值、常见报错见对应子 skill。**②不过就别做 ③**。
+- **三层验收要在最后一步安装之前先跑一次并落盘（before 基线），否则"通过"无法与"本来就对"区分**；配套的 `env -i` 承载 shell 对照法见 `orchestrating-subagents` §9.10。
 - **完成标记不是证据**（2026-10-08 实测两起）：lane 脚本会打印 `LANE_Px_DONE` / `S4_DONE` 之类标记，**失败也照样打印**。判完成只看**产物**——文件是否存在/大小/条数、日志里有没有 `rc=` 行、验收命令是不是真被执行过。实测两次踩中：P4 的 clone **失败**却仍打印了 DONE；S3 被打断后**标记照打**。
 - **shell 退出码也不可靠时要看产物**：该机器**每次 ssh 都会因 `/root/.bashrc` 里那行失效的 `set_env.sh` 而以 exit 1 结束**（§1），所以 `exit=1` 既可能是真失败、也可能只是这行噪声。判据回到产物本身，不要只看退出码。
+  - **`.188` 上 `ssh` 的退出码一律不可作为成功判据**（2026-10-09 实测）：`ssh -n root@192.168.13.188 "echo hi"` 命令本身成功、输出 `hi`，紧接着 `echo $?` 却是 **`1`**——真因就是 `/root/.bashrc: line 36` 那行失效 `set_env.sh`；**非零退出码与命令本身是否成功无关**。判成功只能靠**产物**（落盘文件 / 目录 / 明确写出的标记行）。确实要机判时，让**远端命令自己把结果写进文件**（把 `$?` 或结果 echo 进 `$ROOT/log/...`），再从本机读那个文件——**不要从 ssh 的退出码判**。
+  - **同族注意：不要用跨机时间戳排序事件**（2026-10-09 实测）：**远端时钟比本机慢约 6 分钟**，本机的 17:33 与远端的 17:27 可能是同一瞬间；跨机对时间只认**产物内容 + 你本机读它的时刻**。
 
 ## 5. 从 Windows 驱动远端（所有子 skill 共用；违反会**静默失败**）
 
@@ -186,6 +189,7 @@ python3 -c "from vllm.platforms import current_platform as p; print(type(p).__na
   - **base64 通道实测逐字无损、且不带 BOM**：含中文 + `%{http_code}` 的脚本往返后远端执行结果与本地一致（`确认 磁盘落点 并行` 原样保留、`%{size_download}` 正常展开）。
   - **但 base64 会把体积放大 4/3、且整串要塞进 ssh 的命令行**：本机实测过"命令行走长即溢出/截断"（见 `pwsh-on-windows`）。**脚本超过约 20KB 就不要内联**——改用 `scp`（注意本机 `Set-Content -Encoding UTF8` 会带 BOM，要用 `[System.IO.File]::WriteAllText($p,$s,[Text.UTF8Encoding]::new($false))`），或把 base64 按 ~6000 字符分块 append 再校验 `md5sum`。
   - **不要再无脑加 `tail -c +4`**：本机 `$OutputEncoding` 实测是**无 BOM 的 UTF-8**（`GetPreamble().Length` = 0），管道给 ssh **不注入 BOM** → `tail -c +4` 会**吃掉脚本前 3 个字符**（实测把 `#!/bin/bash` 削成 `bin/bash`；因为接着显式 `bash /tmp/x.sh` 才没报错，改成 `./x.sh` 直接坏）。只有当 `$OutputEncoding` 被显式设成带 BOM 的 `[Text.Encoding]::UTF8` 时才会多出 BOM，那时才需要剥 3 字节——**先探再决定**：
+  - **另一条独立的风险线：源文件自己带 BOM**（2026-10-09 实测）——base64 会把源字节**原样**带过去，**base64 之前要先剥掉 UTF-8 BOM**（首 3 字节 `EF BB BF`），否则远端解出来的脚本首行带 BOM：`bash /tmp/x.sh` 报 `bash: /tmp/x.sh: line 1: ﻿#!/bin/bash: No such file or directory`。**修法**：编码前先看首 3 字节（`[IO.File]::ReadAllBytes($f)[0..2]` 是否为 `239 187 191`），是就先剥；**通道不会替你去掉它**。
 
     ```powershell
     "PROBE" | ssh root@192.168.13.188 "od -An -c | head -1"   # 首字节出现 357 273 277（EF BB BF）= 有 BOM
@@ -201,6 +205,9 @@ python3 -c "from vllm.platforms import current_platform as p; print(type(p).__na
 - **查「谁占着卡 / 谁占着文件」时，你自己的 ssh 包装进程必然自匹配**：`grep -l <pat> /proc/[0-9]*/cmdline` 这类命令的 cmdline 里就含整条命令串，于是 `bash -c ...` 包装进程会被自己命中，得出**假阳性**。必须再用 `ps -ef | grep -v grep` 与 `ls -l /proc/<pid>/fd/` 交叉复核才能判真占用（实测踩过：一度以为 `pid 140974` 是残留安装进程，实为自己那条 ssh）。
 - **base64 推送后要核对「最终目的地」的 md5，不是 `/tmp` 的**（2026-10-08 实测）：`printf '%s' '$b64' | base64 -d > /tmp/x.sh` 只保证 **`/tmp/x.sh`** 正确。若该脚本本该落在 `$ROOT/`（env 脚本就是这种），只核 `/tmp` 的 md5 会让你**误以为推送成功**——本轮实测 `source $ROOT/env_sv0230.sh` **静默失败**，导致整条 S3 在 **CANN 环境变量未设置**的情况下运行。纪律：写完必须 `md5sum <最终路径>`，与本地 `(Get-FileHash -Algorithm MD5 $f).Hash` 逐字比对。
 - **ssh 里永远不要丢弃 stderr（不要 `2>$null`）**：那会丢掉唯一能解释"进程为什么立刻退出"的 traceback——本轮正是它把 `libhccl.so` 的真因藏了起来。改为 `> x.log 2>&1` 落盘再 `grep`。
+- **`curl -o <目标文件>` 连接失败时「什么都不写」**（2026-10-09 实测）：`curl -s -o /tmp/x.txt <url>` 因连接失败**根本不创建** `/tmp/x.txt` ⇒ 紧跟的 `grep … < /tmp/x.txt`（或 `cat`）报 **`No such file or directory`**，**看起来像"数据里没有这个东西"，实际是"文件根本不存在"**（这就是"下游报错离根因很远"的机制）。
+  - **修法**：`curl` 取文件**必须配重试循环**（`for i in 1 2 3 …` + `curl -fsS -o …`，`-f` 让 HTTP 错误码也非零），**并在消费之前做格式校验**；实测有效写法是取 40 位 commit SHA 时**校验 `^[0-9a-f]{40}$`**，不匹配即失败——**`exit 1`，绝不让下游拿空文件继续跑**。
+  - **这条的价值在错误归因**：同一个「文件不存在」报错，可能是**网络失败**、也可能是**数据问题**，必须**在取数那一步就把二者分开**（`[ -s /tmp/x.txt ] || echo CURL_EMPTY >&2; exit 1`）。
 - **重启长任务前先确认旧实例真的死了**：`pgrep -af <name>` 期望输出 `(none)`。本轮出现过**两个同名长任务实例同时写同一个日志文件**，新实例启动时截断了旧文件，据此做出了错误判断（理由：脚本里某段 kill 落在输出被截断处、**实际未生效**）——旧实例还在跑，日志却已经被清空。
 
 ## 6. 不要做什么

@@ -15,6 +15,7 @@ whenToUse: 环境已装好、现在要真的跑模型时才用：起 OpenAI 兼�
 - 在 `192.168.13.188`（文档里代称 `a3`，但 ssh 用 IP，见「前置检查」）上 `vllm serve` 或 `LLM()` 跑模型；`.190`（`a3b`）同理但 ssh 易假死。
 - 要 `sleep()` / `wake_up()` 释放显存，或要 `reload_weights` 热更新权重（见步骤 3.1）。
 - 报 `MemoryError`、`dtype or format of parameter`、`NnopbaseExecutorDoTiling`、`No module named 'triton.experimental'`、`Engine core initialization failed`、`AttributeError: module 'vllm.v1.engine.utils' has no attribute 'get_physical_gpu_ids_for_local_dp_rank'`。
+- **KDA / 线性注意力系模型（Kimi-K3、GLM5next）起不来**：报 `ModuleNotFoundError: No module named 'fla_npu'`、`Error in inspecting model architecture`、`Model architectures ['KimiK3ForConditionalGeneration'] failed to be inspected.` → 见下文「KDA 系模型（Kimi-K3 / GLM5next）的隐藏硬依赖 `fla_npu`」一节（含 glibc 闸门）。
 - 共享机上要决定占哪张 die、用多少显存、用哪个端口。
 - **起服务前的容量规划**（这个 MoE 模型要几张卡、EP/TP/DP 怎么配、64GB 卡真实预算 56.378 GiB 够不够） → 用 `ascend-moe-ep-capacity-planning`（本 skill 从"已经决定要起"开始）。
 
@@ -51,6 +52,8 @@ python -c "import vllm, importlib.metadata as m; print(vllm.__version__, m.versi
 ```
 
 **别读 `vllm_ascend.__version__`**（`.188` 无该属性，用 `importlib.metadata`）。
+
+> **平台层（`current_platform` 不是 `NPUPlatform npu`）失败的第一诊断点**：先 `echo $VLLM_TARGET_DEVICE` —— 只要它是 `cpu`，所有平台插件都被绕过、必然退化成 `UnspecifiedPlatform`（机理、源码行号与配方见 `vllm-ascend-source-install` §5.3）。
 
 ## 步骤
 
@@ -223,6 +226,173 @@ PID=$(ss -ltnp | grep :18000 | sed 's/.*pid=\([0-9]*\).*/\1/' | head -1); kill -
 ss -ltnp | grep :18000 || echo "PORT RELEASED"
 # 只 kill 自己端口上的 PID；绝不用 pkill -f vllm——本机 NPU0 上就有别人的 VLLMWorker
 ```
+
+## KDA 系模型（Kimi-K3 / GLM5next）的隐藏硬依赖 `fla_npu`
+
+**本节记录的是「判据与闸门」，并且已在容器路线端到端验证通过**（起服务 + `/v1/models` 200 + `/v1/chat/completions` 200，见「出路 ③ 落地」一节的逐字实测）。**但宿主机那条路线确实走不通**：`.188` / `.190`（glibc 2.28 / 2.31）上不可能装上 `fla_npu` —— **这一点没有被推翻**，被推翻的只是"只有换机器或自己编两条路"。
+
+### 症状与报错锚点（在**检视模型架构**阶段就炸，不是运行时才炸）
+
+`vllm serve <KDA 模型目录> --load-format dummy …` 逐字原文（**这串就是下次能被搜到的锚点**）：
+
+```text
+(APIServer pid=21595) ERROR 10-09 20:20:52 [registry.py:1114] Error in inspecting model architecture 'KimiK3ForConditionalGeneration'
+(APIServer pid=21595) ERROR 10-09 20:20:52 [registry.py:1114] subprocess.CalledProcessError: Command '['…/python', '-m', 'vllm.model_executor.models.registry']' returned non-zero exit status 1.
+(APIServer pid=21595) ERROR 10-09 20:20:52 [registry.py:1114] RuntimeError: Error raised in subprocess:
+(APIServer pid=21595) ERROR 10-09 20:20:52 [registry.py:1114] ModuleNotFoundError: No module named 'fla_npu'
+pydantic_core._pydantic_core.ValidationError: 1 validation error for ModelConfig
+  Value error, Model architectures ['KimiK3ForConditionalGeneration'] failed to be inspected.
+```
+
+### 谁引入的（vllm-ascend commit `12e7e1cb` 实测行号；全是**模块级** import ⇒ 缺包直接 ImportError）
+
+- `vllm_ascend/ops/kimi_kda.py:15` → `from fla_npu.ops.ascendc import causal_conv1d_fn, causal_conv1d_update`
+- `vllm_ascend/ops/kda.py:11` → `from fla_npu.ops.ascendc import chunk_kda_fwd, recurrent_kda`
+- `vllm_ascend/ops/gdn.py:23` / `:60` → `chunk_gated_delta_rule_fwd` 等
+- `vllm_ascend/models/glm5next/ops/causal_conv1d.py:6` → `causal_conv1d_fn, causal_conv1d_update`
+
+**版本事实（反例，很重要）**：vllm-ascend `9df651d0b`（2026-09-28）的 `kimi_kda.py`（28535 B）对 `fla_npu` **零命中** ⇒ 这个硬依赖是 **2026-09-28 → 2026-10-09 之间**引入的，旧版不需要它。
+**但别把「退回旧 commit」当通用退路**：`9df651d0b` 不含 PR #16959 —— 只有在你不需要新代码时才成立。
+
+### 官方来源（从 vllm-ascend 自己的 CI 逐字抄出）
+
+`.github/workflows/_selected_tests.yaml:266-311`：
+
+```yaml
+env:
+  NPU_TYPE: ${{ matrix.group.npu_type }}
+  GIT_PROXY: https://gh-proxy.test.osinfra.cn/
+run: |
+  FLA_VERSION=26.9.1+deva4a7958
+  FLA_RELEASE_TAG=v26.9.1-beta2
+  case "$NPU_TYPE:$(uname -m)" in ... esac
+  FLA_DOWNLOAD_URL="https://github.com/flashserve/flash-linear-attention-npu/releases/download/${FLA_RELEASE_TAG}/${FLA_WHL}"
+  if [ -n "${GIT_PROXY:-}" ]; then FLA_DOWNLOAD_URL="${GIT_PROXY}${FLA_DOWNLOAD_URL}"; fi
+  curl --fail --location --show-error --silent --retry 3 --retry-delay 5 --retry-all-errors "$FLA_DOWNLOAD_URL" -o "/tmp/$FLA_WHL"
+  echo "$FLA_SHA256  /tmp/$FLA_WHL" | sha256sum --check
+  uv pip install --no-deps "/tmp/$FLA_WHL"
+  python3 -c "import fla_npu.ops.ascendc"
+```
+
+- 仓库 `github.com/flashserve/flash-linear-attention-npu`，release `v26.9.1-beta2`（**prerelease**，2026-09-23）。
+- 文件名模板：`flash_linear_attention_npu_<platform>-26.9.1+deva4a7958-py3-none-manylinux_2_34_<arch>.whl`
+- **URL 里 `+` 必须写成 `%2B`**（否则 curl 拿到的不是那个文件）；装法带 `--no-deps`；**验收 = `python3 -c "import fla_npu.ops.ascendc"` 不报错**。
+
+### 档位 → SOC 映射，以及怎么在自己的机器上定档
+
+| 档位 | SOC |
+|---|---|
+| a2 | `ascend910b` |
+| a3 | **`ascend910_93`** |
+| a5 | `ascend950` |
+
+```bash
+python -c "import torch, torch_npu; print(torch.npu.get_device_name(0)); print(torch_npu.npu.get_soc_version())"
+uname -m
+```
+
+实测（`.188`）：`get_device_name(0)` = **`Ascend910_9382`**、`get_soc_version()` = **253**、`uname -m` = **`x86_64`** ⇒ 取 **a3 + x86_64**。
+（「`Ascend910_9382` 与 `ascend910_93` 同族」的机理见 `vllm-ascend-source-install` §4 的 `-soc_version` 条，**本文件不重复**。）
+
+**可达性实测**（`curl -s -o /dev/null -w %{http_code}`）：`https://gh-proxy.test.osinfra.cn/` = 200、`https://ghfast.top/` = 200、直连 `github.com` 也 = 200（但平时直连常 60s 超时，代理更稳）。
+
+### ★ 先量 glibc，再决定要不要下这个 wheel ★
+
+**该 wheel 的平台标签是 `manylinux_2_34`，且官方只发布这一种**：`/tags` 里 26 个 tag，只有 `v26.9.1-beta2` 是带资产的 release，6 个 wheel **全是 `manylinux_2_34`**。
+
+**两步量法（不必真装就能判；先做这个，再决定下载）**：
+
+```bash
+getconf GNU_LIBC_VERSION
+# 解开 wheel 看里面 .so 需要多新的 glibc
+unzip -o <wheel> -d /tmp/flachk >/dev/null
+for so in $(find /tmp/flachk -name '*.so'); do
+  echo "$so : $(strings -a "$so" | grep -o 'GLIBC_2\.[0-9]*' | sort -V | tail -1)"
+done
+```
+
+实测 wheel 内 `.so` 的 `maxGLIBC`：
+
+```text
+fla_npu/custom_aclnn_extension_lib.cpython-312-x86_64-linux-gnu.so ...... GLIBC_2.32
+.../op_api/lib/libcust_opapi.so ........................................ GLIBC_2.32
+.../op_api/lib/libopapi.so ............................................. GLIBC_2.32
+.../op_proto/es/lib/linux/x86_64/libes_transformer_cust.so ............. GLIBC_2.32
+.../op_impl/ai_core/tbe/op_tiling/liboptiling.so ....................... GLIBC_2.34
+.../op_impl/ai_core/tbe/op_tiling/lib/linux/x86_64/libcust_opmaster_rt2.0.so  GLIBC_2.34
+.../op_proto/lib/linux/x86_64/libcust_opsproto_rt2.0.so ................ GLIBC_2.34
+```
+
+**机器实测**：`.188` = Debian 10 / glibc **2.28**；`.190` = Debian 11 / glibc **2.31** ⇒ **两台都不够**。
+
+**pip 会直接拒绝**（逐字）：
+
+```text
+ERROR: flash_linear_attention_npu_a3-…-manylinux_2_34_x86_64.whl is not a supported wheel on this platform.
+```
+
+**即使绕过 pip（`--target` 或 `unzip -o`）也加载不了**，动态加载器逐字报：
+
+```text
+OSError: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.32' not found
+  (required by .../fla_npu/opp/vendors/fla_npu_transformer/op_api/lib/libcust_opapi.so)
+RuntimeError: Unable to load embedded FLA NPU custom op_api library: .../libcust_opapi.so.
+  Dynamic loader error: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.32' not found
+```
+
+### glibc < 2.32 时的处置（三条出路）
+
+- 结论（**没有被推翻**）：**glibc < 2.32 的宿主机上，KDA / GDN 系模型（Kimi-K3、GLM5next）跑不起来**，其唯一外在表现就是 `ModuleNotFoundError: No module named 'fla_npu'`。
+- 三条出路：
+  1. **换 glibc ≥ 2.34 的机器**。
+  2. 在本机**从源码构建 `fla_npu`**。**未验证：本次未做**（没有构建记录）。
+  3. **★ 改用本机已有的新 glibc 容器镜像（最省事，已实测走通）** → 见下一小节。**上一版这里只写了 ① ②，那句"只有两条出路"已被本轮实测证伪。**
+- **不要升级系统 glibc**（`.188` / `.190` 都是多租户共享机，升 glibc 会连带影响所有租户的运行时）。
+
+### 出路 ③ 落地：用本机已有的新 glibc 容器镜像（已端到端验证）
+
+**根本判据（比背镜像名更重要）**：**glibc 向后兼容** ⇒ 用一个**更高 glibc 的容器**，可以**同时**加载宿主机那套 **glibc-2.28 编的** `torch_npu` / `vllm_ascend_C`，**和**需要 ≥2.32/2.34 的 `fla_npu` —— **一次解开两个卡点**。
+等价说法：**这条依赖卡的从来不是"某台机器"，而是"glibc ≥2.34 的运行环境"；容器是最省事的提供方式。**
+
+**镜像不用拉**（`docker pull` 在本机**不通**：`registry-1.docker.io ... connection reset by peer`）—— **镜像已经在本机**：
+
+```bash
+docker images | grep -E 'vllm-ascend|mindspeed-ops|cann'
+```
+
+实测本机有 `vllm-ascend:main-latest-20261009`（= `quay.nju.edu.cn/ascend/vllm-ascend:nightly-main-a3`，**同一 image id `5d99a6a9e66e`**）、`quay.nju.edu.cn/ascend/vllm-ascend:v0.28.0.rc1-a3`、`…cann:9.1.0-a3-openeuler24.03-py3.12`、`mindspeed-ops:master-a3-openeuler24.03-py3.12-x86_64` 等。
+
+**选镜像的判据 = 进去量 glibc 与 `fla_npu`**（实测 `vllm-ascend:main-latest-20261009`：**Ubuntu 22.04.5 / glibc 2.35**、torch 2.10.0+cpu、torch_npu 2.10.0.post4、vllm 0.30.0）：
+
+```bash
+getconf GNU_LIBC_VERSION
+python -c "import fla_npu.ops.ascendc; print('FLA_OK')"     # 实测打印 FLA_OK ⇒ 镜像里已装好 fla_npu
+```
+
+**坑 ①：docker 里没有 `ascend` runtime**（只有 `runc` / `io.containerd.runc.v2`）⇒ 要**手工直通**：挂 `/usr/local/Ascend/driver`、`/usr/local/dcmi`、`/usr/local/bin/npu-smi`，`--privileged --net=host --ipc=host`；设备节点 `/dev/davinci0..3`（可用则加）、`/dev/davinci_manager`、`/dev/devmm_svm`、`/dev/hisi_hdc` 都在。
+**坑 ②：`PYTORCH_NPU_ALLOC_CONF=expandable_segments:True` 会搞坏 vllm-ascend 的 CaMemAllocator**（`AssertionError`）⇒ 这条路上**不要设**它（与我们过去"设了更省显存"的直觉相反）。
+
+**端到端实测（逐字，可直接当验收基线）**——容器 `k3c-s2` + 真实减层包 `/k3w/kimi_k3_reduced_4l`（`num_hidden_layers=4, num_experts=896, hidden_size=7168, bf16`）：
+
+```text
+args = --dtype bfloat16 --max-model-len 512 --enable-eager --load-format dummy
+       --tensor-parallel-size 4 --enable-expert-parallel --gpu-memory-utilization 0.8
+       --max-num-seqs 4 --trust-remote-code --served-model-name k3
+       --additional-config {"weight_nz_mode": 0}
+日志 = [model.py:692] Resolved architecture: KimiK3ForConditionalGeneration
+       [kimi_k3.py:116] Overriding vision_config.text_hidden_size from 2304 to 4096 to match text_config.hidden_size
+       [model.py:715] Defaulting to tokenizer_mode='kimi_k3' for KimiK3ForConditionalGeneration
+       Application startup complete.
+       "GET /v1/models HTTP/1.1" 200 OK
+       "POST /v1/chat/completions HTTP/1.1" 200 OK
+响应 = {"choices":[{"message":{"content":"  like,NULL like,NULL like,NULL like,NULL"},"finish_reason":"length"}],
+        "usage":{"prompt_tokens":89,"completion_tokens":8}, "system_fingerprint":"vllm-0.30.0-tp4-ep-9df7a6aa"}
+```
+
+- ★ **判据型细节**：`system_fingerprint` 形如 `vllm-<版本>-tp<TP>-ep<EP>-<hash>` ⇒ **可用它一眼确认 TP/EP 真生效了**（本例 `tp4-ep`）。
+- ★ `content` 是重复串**不是失败**（减层 + `dummy` 权重，同步骤 3「小模型输出退化不是环境问题」）：**判据只看两端点 200 且 `content` 非空**。
+- ★ **判容器要走精确过滤器**：`docker ps --filter name=k3c` 是**子串匹配**，会同时命中 `k3c-s2` ⇒ 用 `docker ps --filter 'name=^k3c-s2$'`。
+- ★ **`docker ps` 在本多租户机会列出 ~44 个别人的容器** ⇒ **不要裸跑 `docker ps -a` 刷屏**，一律带 `--filter`。
 
 ## 坑与修法
 

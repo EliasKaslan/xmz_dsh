@@ -19,6 +19,7 @@ whenToUse: 要决定「怎么把 vllm 与 vllm-ascend 从源码装进已有环�
 
 **不要用本 skill（转交）：**
 - 服务起不来、离线推理 / 冒烟 / 权重校验 / 运行时排障 → 用 `ascend-vllm-serve`（本 skill 只管「装得上」，不管「跑得起来」）。
+- **KDA 系模型（Kimi-K3 / GLM5next）运行时还需要 `fla_npu`，且它有 glibc ≥2.32 / 2.34 门槛** → 用 `ascend-vllm-serve`（正文归它，本文件只留这条指针）。
 - torch 栈本身缺或装不上 → 用 `ascend-torch-npu`；triton-ascend 相关 → 用 `ascend-triton-ascend`；CANN → 用 `ascend-cann-env`。
 - 判某模型在昇腾 / vllm-ascend 侧的适配程度与缺口 → 用 `ascend-model-adaptation-recon`。
 - 上游仓库 docs 缺口审计（内部需求 vs docs 主线） → 用 `upstream-docs-refresh-audit`。
@@ -30,7 +31,7 @@ whenToUse: 要决定「怎么把 vllm 与 vllm-ascend 从源码装进已有环�
 
 - Linux + 已装 CANN，且每次操作前 `source` 过 toolkit 与 nnal/atb 两段 `set_env.sh`；gcc/g++ ≥ 8（支持 C++17）**但编自带 C++ 扩展要 ≥ 9（见下一条与 §4.2）**；`MAX_JOBS` 按机器核数设，共享机别打满。
 - **先确认 gcc 版本，它决定 §3 要不要加 `--arctic`、§4.2 要用哪个编译器、以及要不要做 GLIBCXX 兜底**：
-  - `.188`（默认）：系统**只有 gcc/g++ 8.3**，且系统 libstdc++ **无 `GLIBCXX_3.4.26`** → §3 必须加 `--arctic`；**但 `--arctic` 只解决 `arctic-inference` 编不过的问题，编 C++ 扩展 `vllm_ascend_C` 时 gcc 8.3 会直接失败**（torch 头文件要求 GCC ≥ 9）→ 必须按 §4.2 换成 conda 工具链里的 gcc 10；运行时还要 compat_lib 兜底（见 §6 坑 8）。
+  - `.188`（默认）：系统**只有 gcc/g++ 8.3**，且系统 libstdc++ **无 `GLIBCXX_3.4.26`** → §3 **用这套系统 gcc 编时**必须加 `--arctic`（`CC`/`CXX` 已指向 conda gcc 10.4.0 时不需要，见 §3 的范围限定）；**但 `--arctic` 只解决 `arctic-inference` 编不过的问题，编 C++ 扩展 `vllm_ascend_C` 时 gcc 8.3 会直接失败**（torch 头文件要求 GCC ≥ 9）→ 必须按 §4.2 换成 conda 工具链里的 gcc 10；运行时还要 compat_lib 兜底（见 §6 坑 8）。
   - `.190`（备用）：gcc/g++ 10.2，系统 libstdc++ 够用 → §3 不加 `--arctic`（反而要预装它，见 §6 坑 5），§4.2 也不用做。
 - **硬条件：环境里已经有 torch / torch-npu / triton-ascend** —— 本流程会故意注释掉它们的 pin，不会去装它们。先确认：
 
@@ -147,12 +148,15 @@ vllm-ascend 仓没有 `use_existing_torch.py`，用本 skill 自带脚本代替�
 ```bash
 cd $SRC/vllm-ascend
 python3 "$SKILL/scripts/strip_torch_pins.py" .                 # .190 等 gcc>=9 的机器
-python3 "$SKILL/scripts/strip_torch_pins.py" --arctic .        # .188（gcc 8.3）必须加 --arctic
+python3 "$SKILL/scripts/strip_torch_pins.py" --arctic .        # 仅当编译器不支持 C++20（如 .188 系统 gcc 8.3）才需要；CC/CXX 是 conda gcc 10.4.0 时不需要（见下）
 # 先 export SKILL=<本 skill 目录>（如 ~/.dsh/skills/vllm-ascend-source-install），别把尖括号路径直接粘进 shell
 git diff -- requirements.txt pyproject.toml                # 确认只动了目标行
 ```
 
 **`--arctic` 是干什么的**：额外把 `arctic-inference==0.1.1` 也注释掉。它的 C++ 扩展需要 C++20 `<span>`，**gcc 8.3 编不过**；该包只被 vllm 的可选 suffix-decoding 路径使用，vllm-ascend 源码不引用它，所以注释掉是安全的。默认不加这个 flag，`.190` 上的行为与以前完全一致（那里 gcc 10.2 能编，应改用 §6 坑 5 的预装法）。
+
+> **2026-10-09 实测补的范围限定（`--arctic` 不是无条件必做）**：判据是**编译器支不支持 C++20**，不是"哪台机器"。`CC`/`CXX` 指向 conda-forge gcc/g++ **10.4.0**（§4.2 那套 `bi_0921` 的 `x86_64-conda-linux-gnu-gcc` / `-g++`）时，`pip install -r requirements.txt` 实测 **`RC=0`**，`arctic-inference-0.1.1` 由 pip 直接装上、`import arctic_inference` **成功**；该环境全程**没跑过 strip**（`git -C src/vllm-ascend status --porcelain` = **0 行**，§3 一行都没改，安装照样成功）。⇒ 有 conda gcc 10.4.0 这类 C++20 编译器时 `--arctic` **不必要**；只有系统 gcc 8 这类不支持 C++20 的编译器才必须加。
+> 范围仅限于 `arctic-inference` 这一项：**torch 家族注释（第 3 条）与 §6 坑 1 的理由不变**（本轮那个环境另有 `PIP_CONSTRAINT` 兜底，见 §6 坑 9）。
 
 它做的事（就是用户脚本里 `vim requirements.txt` / `vim pyproject.toml` 的目的）：
 
@@ -188,9 +192,12 @@ pip install -e . --no-build-isolation 2>&1 | tee build.log
 - `COMPILE_CUSTOM_KERNELS=1` 才会编 AscendC 算子（`vllm_ascend_C` + aclnn），耗时长（十几分钟起）；不想编就设 0 或删掉这行，只装纯 python。
 - `rm -rf csrc/build build` 清上次产物，避免半成品残留；换过 torch/CANN 版本后**必做**。
 - `SOC_VERSION` 一般不用设（setup.py 用 `npu-smi … -c 0` 自动探测）；npu-smi 不可见时显式设：A2 `ascend910b1`、A3 `ascend910_9391`、300I DUO `ascend310p1`、950DT `ascend950dt_9582`。
-- 构建中监控：`grep -c "error:" build.log`、`find csrc/build -name '*.o' | wc -l`。耐心轮询，别超时重试。
+- 构建中监控：`grep -c "error:" build.log`。**别拿 `find csrc/build -name '*.o' | wc -l` 当进度**（2026-10-09 实测）：`.o` 计数实测 **1421**，但被 `build/binary/ascend910_93/gen/kernel_meta_<Op>_<hash>/` 的**实例**淹没（每个算子实例各一份），**非线性** ⇒ 数它得不到"编到几成"。通用教训见 `orchestrating-subagents` §9.12。
+- **确定性进度判据（2026-10-09 实测，判"编完没有"只认这两条）**：① 下面那条**打包产物** `cann-ops-transformer-custom_linux-x86_64.run` **存在** ⇒ `--target package` 阶段**确已完成**；② 配套看 `_cann_ops_custom` 的**文件数量级**（本轮 **1162 文件 / 50,988,328 B**）。**别把 `binary` 目录个数写死成判据**：§5.2 那次记的是 `208` 个，本轮是 **0**（布局不同）⇒ 判「`.run` 存在 + 文件数量级」，不判 `binary` 目录数。
+- **编译器退出判据（别去等 `ccec` / `cc1plus`）**：AscendC 真正的编译器是 **`bisheng`** 与 CANN 的 **`opc.py`** ⇒ `pgrep -c -f bisheng` = **0** 且 `pgrep -c -f opc.py` = **0** 才算编译进程收摊。
+- **`-soc_version=Ascend910_9391` / 构建目录 `ascend910_93` 与 `torch.npu.get_device_name(0)` = `Ascend910_9382` 不是不匹配**（同族；`get_soc_version()` = `253`）⇒ **不要据此判定编译目标错**、也别去改 `SOC_VERSION`。
 - **判"编到哪一步了"要看真目录**（2026-10-08 实测）：真正的构建目录是 **`src/vllm-ascend/csrc/build`**，**不是** `src/vllm-ascend/build`；AscendC 产物落在 `src/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer`（本轮实测 **87 MB / 1013 个文件**，与 §5.2 一致）。
-- 另有一个**打包产物**：`csrc/build/cann-ops-transformer-custom_linux-x86_64.run`（由 `cpack` + `makeself.sh --gzip` 打出）——有它说明 `--target package` 那一步真跑完了。
+- 另有一个**打包产物**：`csrc/build/cann-ops-transformer-custom_linux-x86_64.run`（由 `cpack` + `makeself.sh --gzip` 打出）——有它说明 `--target package` 那一步真跑完了（2026-10-09 实测 **16,268,894 B**）。
 - **耗时实测**：这一装（`cmake --build . --target package -j32` + ninja + cpack 打包）在 **load≈287** 的机器上约 **20 分钟**。别按空载经验设超时。
 - **`--no-build-isolation` 需要先预装 `cmake ninja wheel`**：vllm 的 `[build-system].requires` 要 `cmake>=3.26.1` / `ninja`，而 `requirements/common.txt` **不带**这两个 ⇒ 走这条路前先 `pip install cmake ninja wheel`；另需 `setuptools_rust setuptools_scm`（§2 已含）。
 
@@ -239,6 +246,7 @@ export CXX=$BI_TC/bin/x86_64-conda-linux-gnu-g++
 export C_COMPILER=$CC CXX_COMPILER=$CXX    # vllm-ascend 自己的 envs.py 会转成 -DCMAKE_CXX_COMPILER
 ```
 
+- **实测可用的整条调用**（2026-10-09，`.188`；本机系统 gcc/g++ = **8.3.0**（Debian 10）、conda = **10.4.0**）：`COMPILE_CUSTOM_KERNELS=1 MAX_JOBS=8 CC=$BI_TC/bin/x86_64-conda-linux-gnu-gcc CXX=$BI_TC/bin/x86_64-conda-linux-gnu-g++ C_COMPILER=$BI_TC/bin/x86_64-conda-linux-gnu-gcc CXX_COMPILER=$BI_TC/bin/x86_64-conda-linux-gnu-g++ PIP_CONSTRAINT=$CONSTR pip install -e . --no-build-isolation`
 - 只设 `CC`/`CXX`、或只设 `C_COMPILER`/`CXX_COMPILER`，两种都实测能过；**建议两者都设**（`CC`/`CXX` 是 torch `cpp_extension` 与 BI python wheel 源码编译读的）。
 - ⚠️ **绝不把该 env 的 `bin` 前置进 `PATH`**：它是带自己 `python`/`pip` 的 conda env，前置后 `pip` 会解析到它的 pip，**把 vllm-ascend 装进错误的 conda env**（静默、后果严重）。只用 `CC`/`CXX` 的绝对路径指编译器。
 - 换过 torch 或改过 pin 后**必须 `rm -rf csrc/build build`**（§4 已含），否则 cmake 沿用缓存里的旧编译器。
@@ -286,7 +294,7 @@ python3 -m pip check        # 仅供了解；**不是验收判据**（可用环�
 
 `COMPILE_CUSTOM_KERNELS=1` 的产物落在**包内**，不在 CANN 的 opp/vendors 下：
 
-- 落点：`<site-packages 或源码树>/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/`，含 `bin/`、`op_api/lib/libcust_opapi.so`、`op_impl/{ai_core,cpu}`、`op_proto/`、`scripts/`、`version.info`。实测 **1013 个文件 / 87M / 208 个 `binary` 目录**；而 `$ASCEND_OPP_PATH/vendors/` 下**只有** `batch_invariant`。
+- 落点：`<site-packages 或源码树>/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/`，含 `bin/`、`op_api/lib/libcust_opapi.so`、`op_impl/{ai_core,cpu}`、`op_proto/`、`scripts/`、`version.info`。实测 **1013 个文件 / 87M / 208 个 `binary` 目录**（**`binary` 目录数不是判据**：2026-10-09 另一次实测是 **1162 文件 / ~51 MB / `binary` 目录 = 0**，布局随构建方式不同 ⇒ 只判「`.run` 产物存在 + 文件数量级」，见 §4）；而 `$ASCEND_OPP_PATH/vendors/` 下**只有** `batch_invariant`。
 - → 「opp/vendors 里没有 vllm_ascend 就以为算子没编」是**假阴性**，别据此重编。
 - 判「这批算子按哪个 CANN 编的」：
   ```bash
@@ -295,6 +303,27 @@ python3 -m pip check        # 仅供了解；**不是验收判据**（可用环�
   ```
 - 判「扩展运行时真加载了哪套 CANN 库」：import `vllm_ascend.vllm_ascend_C` 后正则扫 `/proc/self/maps` 里的 `cann*` 路径 → 实测**全部命中 `cann_9_1_0`**。
 - `vllm_ascend_C` 的 `dir()` 公开符号**只有** `['init_module','python_create_and_map','python_unmap_and_release']` 三个 —— **别拿公开符号个数判断编译是否失败**。
+
+### 5.3 平台层失败的第一诊断点：`VLLM_TARGET_DEVICE=cpu`（2026-10-09 从源码读到）
+
+§5 里那条 `current_platform` 检查退化成 `UnspecifiedPlatform` 时，**第一步先看这个变量**：
+
+```bash
+echo $VLLM_TARGET_DEVICE        # 期望为空；为 cpu 就是病根
+unset VLLM_TARGET_DEVICE        # 若为 cpu，在本 shell 清掉后重跑 §5 的 current_platform 检查
+```
+
+- **机理（逐字）**：`vllm/vllm/platforms/__init__.py:237` 是 `if envs.VLLM_TARGET_DEVICE == "cpu": return cpu_platform_plugin()` —— 这一句**在咨询任何平台插件之前就 return** ⇒ 只要该变量是 `cpu`，**所有插件都被绕过**，平台层必然退化成 `UnspecifiedPlatform`。更难看的是插件抛错被 `except Exception:` **吞掉、只记在 `debug` 级** ⇒ 正常日志里一点线索都没有。
+- **纪律：一键激活脚本（§7.1）里绝对不要 `export VLLM_TARGET_DEVICE`**。它是**运行时**读取的（`vllm/vllm/envs.py:89` 定义、`:604` 读 `os.getenv`）；§2 里构建期那个 `VLLM_TARGET_DEVICE=empty`（让 `ext_modules=[]`）与运行时**无关**，别把两者混起来用。
+
+### 5.4 拿已知 good 的参考环境当 oracle（**只读**：绝不写入、绝不 kill 它的进程）
+
+参考环境 `REF=/mnt/share/vllm/conda_envs/xmz_0921`（2026-10-09 实测）。**上面还跑着别的团队的 Kimi-K3 作业**，只读。
+
+- **佐证 commit 选择**：`ls -d $REF/lib/python3.*/site-packages/vllm-*.dist-info` → 实测 `vllm-0.1.dev1+gced6857af.d20260928.empty.dist-info` ⇒ 同一个 vllm commit `ced6857af`，是对我们配对 commit 的**独立佐证**。
+- **只能当"打包形态"oracle，不能照抄它的 commit**：它的 `vllm_ascend-0.19.1rc2.dev2454+g9df651d0b.d20260928.dist-info` 是**从本地 clone `9df651d0` 构建的、不是 upstream main**。
+- **判自己的 entry_points 正常吗**：`grep -A2 'vllm.platform_plugins' $REF/lib/python3.*/site-packages/vllm_ascend-*.dist-info/entry_points.txt` → 实测 `ascend = vllm_ascend:register`，与本仓 `setup.py:507` **逐字相同**。
+- **判 `pip check` 的抱怨是不是噪声**：两边都有**逐字同一句** `opencv-python-headless 5.0.0.93 has requirement numpy>=2, but you have numpy 1.26.4` ⇒ 参考环境也有 = **既定噪声**（实测 `import cv2` 正常、版本 `5.0.0`）⇒ **不要动 opencv / numpy**，并再次确认 `pip check` **不是验收判据**（§6 坑 1b）。
 
 ## 6. 高频坑
 
@@ -330,7 +359,7 @@ python3 -m pip check        # 仅供了解；**不是验收判据**（可用环�
    > 另：`csrc/build_aclnn.sh` 只删 `csrc/output` 与 `csrc/build_out`、**保留 `csrc/build`**（自己会打 `preserving csrc/build and cleaning output dirs`），而 `HI_PYTHON` 是 `CACHE STRING` → 选错的解释器会**跨轮存活**。所以清缓存要写 `rm -rf csrc/build csrc/output csrc/build_out build`（带了 aclnn 那套时 `csrc/build` 也要删），别只删 `build`。
 7. 磁盘：算子编译产物与 pip 缓存很大，`TMPDIR` / `PIP_CACHE_DIR` 指到大盘，别把 `/` 写满。
 8. **（`.188` 专属）gcc 8.3 的两个连带问题**：
-   - `arctic-inference` 编不了 → §3 必须加 `--arctic`（与坑 5 的预装法相反，别搞混）。
+   - `arctic-inference` 用**系统 gcc 8.3** 编不了 → §3 必须加 `--arctic`（与坑 5 的预装法相反，别搞混）；`CC`/`CXX` 指向 conda gcc 10.4.0 时它编得过、`--arctic` **不需要**（2026-10-09 实测，见 §3）。
    - 系统 libstdc++ 无 `GLIBCXX_3.4.26`，而 tiling 库 `libcust_opmaster_rt2.0.so` 依赖它 → 运行时（不是构建期）报 `dtype or format of parameter` / `NnopbaseExecutorDoTiling`，**看着像算子 API 用错，其实是缺符号**。修法：把 conda 环境里的新版 libstdc++ 放进一个目录并前置到 `LD_LIBRARY_PATH`：
      ```bash
      mkdir -p $BI_ROOT/compat_lib
@@ -371,6 +400,11 @@ python3 -m pip check        # 仅供了解；**不是验收判据**（可用环�
     - **判"是不是卡在这上面"的可复制证据（父 pip 进程 pid）**：`awk '{print $14+$15}' /proc/<pid>/stat` 隔 12s 取两次 **delta=0**；`grep State /proc/<pid>/status` = `S (sleeping)`；`cat /proc/<pid>/stack` = **`pipe_read`**；`ss -tnp | grep pid=<pip>` 出现 **`CLOSE-WAIT …:443`**；`ls -l /proc/<子进程>/cwd` 指向 **`pip-install-*/llguidance_*`**（元凶一眼看出）；进程树里能看到 **`rustup-init -y --no-modify-path --profile minimal --default-host x86_64-unknown-linux-gnu`**。
     - 旁证：本机自建并留下缓存的 wheel 文件名是 `llguidance-1.7.6-cp39-abi3-linux_x86_64.whl`（**`linux_x86_64`、无 manylinux 前缀**）——这正是"本机自建"的标志，也是它能被 pip 接受的原因（`linux_x86_64` 在兼容标签里，优先级低但可用）。
     - （历史记录，仍可能有用）sdist 自带 `rust-toolchain.toml` 要求 `channel = "1.95.0"` + `components = ["clippy","rustfmt"]`；真要走源码构建时，`export PATH=/root/.cargo/bin:$PATH` + `export RUSTUP_TOOLCHAIN=stable-x86_64-unknown-linux-gnu`（完整三元组名，且该 toolchain 已在 `rustup toolchain list` 里）可绕开。**首选仍是 `--only-binary=llguidance`，别把 Rust 装法写进通用流程。**
+
+16. **版本串形态「正常劣化」不要修**（2026-10-09 实测）：
+    - `pip install -e .` 会用 setuptools_scm 往**源码树**写 `vllm_ascend/_version.py`（`setup.py:416` 的 `get_version(write_to=…)`）——源码树里多出这个文件属正常，别当脏改动清掉。
+    - **`--depth 1` 且 clone 里没有 tag ⇒ 拼不出 `.devNNNN+gSHA` 后缀**：实测得到 `0.29.0rc1`（§8 记的正常形态是 `0.19.1rc2.dev2317+gbf439330c`）⇒ **形态差异、无功能影响**，不要为它重 clone 或补打 tag。
+    - `vllm.__version__` 实测 `0.30.1.dev0+gced6857af.d20261009`（合成 tag 不在真实 HEAD 可达路径 + dirty tree 导致 scm 降级）——**不要设 `VLLM_VERSION_OVERRIDE` 去"修"这个串**：它只是显示值，§5.1 的 `vllm_version_is` 判的是**版本线**。
 
 ## 7. 在 Windows 上驱动远端（与 `ascend-env` §5 同套规则）
 
@@ -429,6 +463,13 @@ python3 -m pip check        # 仅供了解；**不是验收判据**（可用环�
 
 ## 9. 维护记录
 
+- **2026-10-09（融合 `.188` 源码安装实测：1 处证伪断言修正 + 1 处进度判据修正 + 3 处新增）**：
+  1. **修正 §0 / §3 / §6 坑 8 —— `--arctic` 由「`.188` 必加」改为按编译器限定**：只在编译器不支持 C++20（系统 gcc 8.3）时才需要；`CC`/`CXX` 指向 conda gcc 10.4.0 时 `arctic-inference 0.1.1` 由 pip 直接装上、`import arctic_inference` 成功，且该环境全程未跑 strip（`git status --porcelain` 0 行）。限定范围仅限 `arctic-inference` 这一项，torch 家族注释的理由不变。
+  2. **修正 §4 构建进度判据**：删掉「`find csrc/build -name '*.o' | wc -l` 当进度」（1421 个 `.o` 被 `kernel_meta_<Op>_<hash>/` 实例淹没、非线性）；改为**确定性产物**：`.run` 存在（实测 16,268,894 B）+ `_cann_ops_custom` 文件数量级（1162 文件 / 50,988,328 B）；写明 `binary` 目录数（208 vs 0）不能当判据、编译器退出看 `bisheng` / `opc.py` 归零、`Ascend910_9382` 与 `ascend910_93` 不是不匹配。
+  3. **新增 §5.3**：平台层失败的第一诊断点 `VLLM_TARGET_DEVICE=cpu` —— `vllm/vllm/platforms/__init__.py:237` 在任何插件之前就 return cpu 平台，插件异常被 `except Exception:` 吞成 `debug` 级；纪律：激活脚本绝不 export，排查第一步 `echo $VLLM_TARGET_DEVICE`。
+  4. **新增 §5.4**：拿已知 good 的参考环境 `REF=/mnt/share/vllm/conda_envs/xmz_0921`（**只读、别 kill 它的进程**）当 oracle 的四种比对法（commit 佐证 / 打包形态 / `entry_points.txt` 逐字比对 / `pip check` 既定噪声）。
+  5. **新增 §6 坑 16**：版本串形态「正常劣化」不要修（`--depth 1` 无 tag ⇒ `0.29.0rc1`；`vllm.__version__` 的 `.d20261009` 合成串），也别为此设 `VLLM_VERSION_OVERRIDE`。
+  6. §4.2 补一条**实测可用的整条调用**（含 `MAX_JOBS=8`、`PIP_CONSTRAINT` 与四个编译器变量）。
 - **2026-10-08（第三批：1 处勘误 + 1 处补全 + 6 处新增，全部为 `.188` 实测）**：
   1. **勘误 §5.1**：原「按 release tag 装完**必须** `export VLLM_VERSION=<tag>`，否则 `vllm_version_is` 为 `False`」**被证伪**——vllm `v0.23.0` 的 `setup.py` 只认 `VLLM_VERSION_OVERRIDE`（逐字 `946`/`947` 两行），且不导任何变量时 `vllm_version_is("0.23.0")` 本来就 `True`；该函数是**版本线**判定（`0.23.1.dev0+g0fc695fc6…` 实测 `True / False / False`）。§6 坑 10/11、§7.1 第 5 项已同步改掉，**description 里的「须 export VLLM_VERSION」也一并修正**。
   2. **§6 坑 15 补全（原结论「`manylinux_2_31` wheel + glibc 2.28 装不上 → 回退 sdist」成立，不要改）**：实测 `.188` glibc `2.28`、`pip debug --verbose` 平台标签上限 `manylinux_2_28`，而 PyPI 上 `llguidance 1.7.6` 的 x86_64 wheel 就是 `llguidance-1.7.6-cp39-abi3-manylinux_2_31_x86_64.whl`（1.7.x 每版 15 个 wheel）⇒ 本机**有 wheel 但装不上**。**新增方法论教训**：`pip download --only-binary=:all:` 的成败**不能**用来判「某包有没有 wheel」——它分不清「没有 wheel」与「有 wheel 但平台标签不兼容」，必须 `curl -s https://pypi.org/pypi/<pkg>/<ver>/json` 读 `urls[].filename`。修法 `--only-binary=llguidance` 的机理补全为「本机无可用 wheel ⇒ pip 索引候选集为空 ⇒ 采用已安装的 1.7.6」，并保留「预先装好 llguidance 不足以绕过」的反例与六条取证判据。

@@ -1,6 +1,6 @@
 # EXCLUDED - items deliberately kept out of the snapshot
 
-- generated (utc): 2026-10-09T10:04:55Z
+- generated (utc): 2026-10-10T01:30:03Z
 - generator: sync-dsh-repos.ps1
 - relative paths and byte sizes only. No file content is recorded in this file.
 - counts are a point-in-time measurement; the sessions trees grow while DSH runs.
@@ -18,8 +18,8 @@ DIR | .secrets | files=4 | bytes=9251
 DIR | launcher\runtime\node_modules | files=26621 | bytes=475341646
 DIR | profiles\headless\node_modules | files=0 | bytes=0
 DIR | profiles\web\node_modules | files=4 | bytes=2182
-DIR | sessions | files=682 | bytes=266455760
-DIR | storages | files=671 | bytes=12305851
+DIR | sessions | files=721 | bytes=279621881
+DIR | storages | files=710 | bytes=13086955
 
 ## File-level exclusions (name patterns, matched at any depth)
 ## rule: robocopy /XF *credentials* *.key *.pem *.token .credentials.yaml *.zstd

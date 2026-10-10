@@ -105,6 +105,20 @@ whenToUse: 写/审 vllm-ascend 的 e2e 用例落位与 CI 登记时用（模型�
 5. 用例引用的模型 ID 在 ModelScope 有仓（否则离线 CI 拉不到权重）。
 6. 门禁**在 Linux 上**跑过（步骤 10 的 scratch 跑法）：`[2] E2E: N/N covered` 里 N 比基线大 1、MISSING=0、退出码 0、`[5]` unknown marker value = 0。在 Windows 上跑出的 MISSING 不作数。
 
+## 零权重范式：权重搬运类 e2e 用例只需要一个 `config.json`
+
+**实测对象**：`tests/e2e/pull_request/rlhf/weight_transfer_test_utils.py`（**712 行**，commit `12e7e1cb`）。该 harness 里**已经存在**"减层 + 合成权重"范式，**不必自己发明**——给新模型加权重搬运用例照抄它即可。
+
+- `MODEL_CASES`（`:149` 起）里既有的 `qwen3.5-35b-a3b-moe-layout` 用例**就是**这个范式：
+  `hf_overrides={"architectures": [...], "text_config": {"num_hidden_layers": 4, "layer_types": [...]}}` ⇒ **减层靠 `hf_overrides`，不靠改真权重**。
+- 权重由 `FixedRandomWeightSource` **合成**（迭代参数 yield name/shape/dtype），`write_checkpoint`（`:419`）用 `save_file` 写出 `model.safetensors`。
+- **唯一的联网点只有一个文件**：`write_checkpoint` 里 `:439 from huggingface_hub import hf_hub_download`、`:444 shutil.copyfile(hf_hub_download(self._case.model, "config.json"), target / "config.json")` ⇒ **只取 `config.json`，不取任何权重**。
+
+⇒ **可复用判据**：给新模型加权重搬运 e2e 用例时，**只需一个能提供 `config.json` 的来源**（Hub / ModelScope 仓，或改成本地目录优先），**权重全部合成** —— **不需要真权重、不需要下载模型**。（与步骤 11「零 Hub 调用」的自包含做法同族；区别是这条直接来自 harness 自带的既有用例，可照抄。）
+
+- **当时的真实缺口（可复现判据）**：`grep -c -i kimi <该文件>` 实测 = **0** ⇒ 该 harness 里**没有** Kimi 用例。
+- **同一道门禁的另一次实测（2026-10-09；仓库状态与步骤 10 那次不同，条数自然不同，两者不矛盾）**：Windows 本地直跑仍**全量假报** `E2E: 0/146` + **146 条** `✗ MISSING: tests\e2e\…` + `exit 1`（反斜杠根因同步骤 10，**不许据此改仓库**）；**真门禁侧的读数**（Windows 必然全假报 ⇒ 这两个数不可能来自 Windows）为：**未登记 → `E2E: 146/147` + `✗ MISSING` + `exit 1`；登记后 → `147/147` + `exit 0`**。
+
 ## 补强实测（merge 4004d10e）：LEAKED / marker / 悬空引用 / 改名 / 行为签名
 
 以下六块全部取自同一次实测：merge commit `4004d10e9b82b6bb36d7093a8e8ae19bdb97a1f6`（实测父 = `baa023ada41a5b889cac6249845a688aab130892`）。上文已写过的口径在此只做**补强**——把"规则"变成"该提交上的实测证据"，不重复陈述。

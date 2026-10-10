@@ -1,6 +1,6 @@
 ---
 name: github-pr-flow
-description: 向 GitHub 上游开源仓（如 vllm-project/vllm-ascend）从个人 fork 提 PR 的全 API 流程（classic PAT）——token 验证与 403/401 判因、规范调研、DCO 签名提交、REST API 创建/关闭/重开 PR 与回读校验、CI 判读、反向抓既存 PR 做离线终审（files API + 缩进取证）。适用于"在 GitHub 仓提个 PR / 关掉或重开 PR / 到 fork 推分支 / token 报 403 说没权限 / DCO 签名校验不过 / commit message 带引号导致提交静默失败 / PR 标题前缀或模板不合规 / CI 挂的 step 是不是我的问题 / 不知道 run_id 怎么拿"。不适用：目标是 GitCode 上的任意仓（含 MindSpeed-Agent） → 用 `gitcode-pr-flow`；要解决本机 PowerShell 命令本身的坑 → 用 `pwsh-on-windows`。
+description: 向 GitHub 上游开源仓（如 vllm-project/vllm-ascend）从 fork 提 PR 的全 API 流程（classic PAT）——token 验证与 403/401 判因、DCO 签名提交、REST API 创建/关闭/重开 PR 与回读校验、CI 判读、反向抓既存 PR 做离线终审、rebase/amend 后判上游基线漂移与安全重推。适用于"在 GitHub 仓提个 PR / 关掉或重开 PR / 到 fork 推分支 / token 报 403 说没权限 / DCO 签名校验不过 / commit message 带引号导致提交静默失败 / PR 标题前缀或模板不合规 / CI 挂的 step 是不是我的问题 / 不知道 run_id 怎么拿 / 上游 main 又前进了 / rebase 后重推被拒"。不适用：目标是 GitCode 上的任意仓 → 用 `gitcode-pr-flow`；本机 PowerShell 命令本身的坑 → 用 `pwsh-on-windows`。
 whenToUse: 要在 GitHub 上游仓库（尤其 vllm-project/vllm-ascend）提交 / 关闭 / 重开 PR、往 fork 推分支、判断 token 权限，或做 DCO 签名提交时使用。模型看不到本节。
 ---
 
@@ -153,6 +153,7 @@ Invoke-RestMethod "https://api.github.com/repos/<owner>/<repo>/actions/runs/<run
 - **2026-09-29 完善（第二轮）**：⑥ 修掉 §2 的 P0——`$msg | git commit -F -` **也会写进 BOM**（实测 stdin 注入字节 `ef bb bf 41 42 43 0d 0a`），且原自检 `(git log -1 --format=%s)[0]` **对已损坏的提交恒报 100（假 OK）**，故删去该自检、改为按原始字节查；解法换成 `[IO.File]::WriteAllText(..., UTF8Encoding $false)` + `git commit -F 文件`（实测通过）；⑦ §5 补「改 PR 标题/描述」的 PATCH（含中文必须走 UTF-8 字节）；⑧ §2 补 `--depth 1` 的 ahead/behind 代价；⑨ 勘误：那组 PR 号在引言而非 §0。
 - **2026-09-29 凭据迁移（用户决策：允许缓存 / 移出 skill 目录 / 加 .gitignore）**：`skills\github-pr-flow\token.txt` → **`~\.dsh\.secrets\github-pr-flow.token`**。SHA256 搬运前后一致（41 B 未变），旧路径已删除；新建 `~\.dsh\.gitignore`（`.secrets/`）与 `.secrets\.gitignore`（`*` + `!.gitignore` 自忽略）。§0 已改为凭据策略的单一出处，`gitcode-pr-flow` / `dsh-skill-authoring` / `dsh-skill-self-audit` 改为指向此处。
 - **2026-10-08 凭据策略反转（用户决策）**：**取消"凭据文件必须在 skill 目录之外"**——现在**鼓励 skill 直接写明凭据文件位置**，`ascend-env\credentials.txt` 就地保留；PAT 当前位置 `~\.dsh\.secrets\` 保持不动（两处都合法）。禁止项收窄为：不进仓内文件、不进日志/命令历史、不进 `description`。§0 单一出处地位不变，`gitcode-pr-flow` / `dsh-skill-authoring` / `dsh-skill-self-audit` 三处引用已同步改写。
+- **2026-10-09 完善**：⑩ 新增 **§12「上游基线漂移与安全重推」**（上游基线漂移的三条判据 / rebase 后用真父提交做范围检查 / LF 不变量落在 blob / 带显式旧 sha 的 `--force-with-lease` / PS 5.1 读 `pulls/<n>/files` 单元素数组塌陷）；⑪ description 削掉两处可省措辞（个人 / 规范调研 / files API 缩进取证、`（含 MindSpeed-Agent）`）并补两条触发句式（「上游 main 又前进了」「rebase 后重推被拒」）。
 
 ## 10. 反向流程：抓既存 PR 做离线终审（REST API 取证）
 
@@ -281,3 +282,70 @@ for($i=$a;$i -lt $b;$i++){ $l=$L[$i]; '{0,4}: [{1,2}] {2}' -f ($i+1), ($l.Length
    同理，它给的"建议摘要"可能是**旧 revision** 的内容（文件数、条目都对不上当前 diff），要拿 `files` API 核对。
 
 其余判据同 §10.5：**`files` API 才是事实**，body 会过时。
+
+## 12. 上游基线漂移与安全重推（rebase / amend 之后）
+
+§0–§11 都假设分支还跟得上上游。本节专治「上游 main 又前进了 / 我们 amend 或 rebase 过 / 要重推 fork」这一段——**下面四条判据每条都实测踩过坑，照抄比自创稳**。
+
+### 12.1 判「上游是不是已经自己修好了我们的缺口」不能只看 `base.sha`
+
+`GET /pulls/<n>` 的 `base.sha` 是**建 PR 时**记下的目标分支 sha，之后**不随上游推进而更新** ⇒ 拿它判「我们的缺口还在不在」必错。三条要一起上：
+
+1. **取分支真实父提交**（我们的改动实际落在哪个 commit 上）：`git log -1 --format=%P`（rebase 后它会变，见 §12.2）。
+2. **逐路径比对** PR 目标文件在父提交与 `upstream/main` 上的 blob。
+3. **只有「我们有改动、而 main 上没有」才算真缺口**——只看 base 与 main 的 diff，会把上游**新提交**误算成我们的缺口。
+
+```powershell
+git fetch upstream main                      # ① 每次动手前重取 tip
+git log -1 --format="%H %s" upstream/main
+git rev-parse HEAD:<path>                    # ② 我们侧该文件的 blob sha
+git rev-parse <真父提交>:<path>              #    我们的基线侧
+git rev-parse upstream/main:<path>           #    main 侧：与 ② 相等 ⇒ 上游已含该内容
+```
+
+- **每次动手前重取 tip，不要复用上一轮的结论**：实测 `git fetch upstream main` 把 tip 从 `d03d385` 推到 `1d5b6c4`（又前进 1 个提交，上一次记下的 sha 当场过期）。
+- **比 blob sha，不要比文件的 sha256**：`raw.githubusercontent.com` 下回来的 blob 是 **LF**，而 `core.autocrlf=true` 的 Windows 检出是 **CRLF** ⇒ 同一份内容两份字节，sha256 必然不等。正确口径：
+  ```powershell
+  curl.exe -sL -o "$env:TEMP\<name>" https://raw.githubusercontent.com/<o>/<r>/main/<path>
+  git hash-object "$env:TEMP\<name>"         # 结果拿去和 git rev-parse upstream/main:<path> 比
+  ```
+
+### 12.2 rebase 后判「我到底改了哪些文件」必须用**当前实际父提交**
+
+`git diff --name-only <旧 base>..HEAD` 会把**上游新进的提交**一起算进范围；rebase 已经把基准换成新的父提交，旧 base 不再代表你的起点。
+
+```powershell
+$p = git log -1 --format=%P        # 真正的父提交
+git diff --name-only "$p..HEAD"
+```
+- 实测：拿**旧 tip** 比回 **11** 个文件（假象）、拿**真父提交**比回 **7** 个文件（真值）——多出来的 4 个全是上游新提交带的文件。**基准写错，范围检查就假报「多改了 4 个文件」。**
+
+### 12.3 「行尾必须是 LF」这条不变量落在 **blob**，不在工作树
+
+- `core.autocrlf=true` 的 Windows 检出**工作树本来就是 CRLF**：`git ls-files --eol` 回 `i/lf w/crlf`，实测工作树 1199 个 CRLF，全部正常。
+- 正确验收 = 读**提交进 index 的 blob**：`git show HEAD:<path>` 的字节里 **CR == 0**。
+- **照「工作树不许有 CR」去强改，反而引入偏差**——判据写错会把合规检出判成失败，把下游引向「重新规范化整个文件」的返工。这是**「判据写错会误导下游」的实例**，不是格式偏好问题。
+- 工作树层面的配套用法见 **§2 坑 3**（改完 `git diff --stat` 确认只有目标行；整文件变更=换行符被动过）——两条一起用，**不要**拿 `git diff` 的整文件变更去否掉上面这条 blob 判据。
+
+### 12.4 amend / rebase 后向 fork 重推的安全形态
+
+```powershell
+git -C <w> push https://<token>@github.com/<owner>/<repo>.git HEAD:<branch> --force-with-lease=<branch>:<旧sha>
+```
+- **必须带显式旧 sha**。只写 `--force-with-lease` 的语义是「远端 ref 与我本地记录一致就放行」——远端被他人更新后本地记录已刷新，它照样通过 ⇒ 那一刻它就是 `--force`，不是保护。带上 `<ref>:<旧sha>` 才是「远端必须仍是我上次看到的那个 sha」。共享分支上的既有配方（含 `--dry-run` 先验一次、`refs/backup/` 长期回滚）见 `gitcode-pr-flow` **§6 ④**。
+- 旧 sha 从**上一次 push 之后**取：`git ls-remote <fork-url> refs/heads/<branch>`；**不要**填刚 amend 出来的新 sha。
+- **推完两条必核**：`git remote -v` 与 `.git\config` 里**不得出现带 token 的 URL**（token 只走一次性 URL，见 §3）。
+- **amend 后核 DCO 没丢**：`git log -1 --format=%B` 里 `Signed-off-by:` 行**必须还在**——`commit --amend` 会重放消息，丢了 DCO 一定挂 CI（§6/§7）。
+
+### 12.5 本节踩到的 `Invoke-RestMethod` / git 坑（通用解码表见 `pwsh-on-windows`）
+
+- **`Invoke-RestMethod` 在 PS 5.1 下把单元素 JSON 数组塌陷成对象**：读 `GET /pulls/<n>/files` 会拿到 `Count == 1` 的**假值**（真实 7 个文件）——这会直接动摇 §10.5「`files` API 才是事实」的可信度；§10.2「`files.json` 条数 == `changed_files`」因为读的是**落盘文件**，不受影响。修法二选一：
+  ```powershell
+  # ① 走原始字节再自己解析（PS 5.1 下最稳）；UTF8 解码 idiom 的单一出处见 pwsh-on-windows
+  #    未验证：本行是按「-UseBasicParsing + RawContentStream + ConvertFrom-Json」三件套口径拼合的，未逐字复跑
+  $r = Invoke-WebRequest -UseBasicParsing -Uri "https://api.github.com/repos/<o>/<r>/pulls/<n>/files?per_page=100" -Headers $h
+  $files = [Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray()) | ConvertFrom-Json
+  # ② 或先判类型再数：单元素时 ConvertFrom-Json 给的是 PSCustomObject，不是数组
+  $n = if ($files -is [array]) { $files.Count } else { ($files | Measure-Object).Count }
+  ```
+- **`git grep --no-filename` 本机 git 不支持**：报错原文 `error: unknown option 'no-filename'` ⇒ 改 `-l`（只回文件名），或去掉该选项。
