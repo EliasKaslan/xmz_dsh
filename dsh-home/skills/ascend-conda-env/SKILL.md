@@ -70,11 +70,13 @@ bash /mnt/share/x00886548/workspace/setup_conda.sh
 ```bash
 source /mnt/share/x00886548/miniconda3/etc/profile.d/conda.sh
 MIRROR="--override-channels -c https://mirrors.nju.edu.cn/anaconda/pkgs/main -c https://mirrors.nju.edu.cn/anaconda/pkgs/r"
-conda create -n vllm312 python=3.12 -y $MIRROR    # 默认落点 /mnt/share/vllm/conda_envs/vllm312（系统盘，不推荐）
-conda create -p /home/vllm/x00886548/envbuild/envs/vllm312 python=3.12 -y $MIRROR   # 大环境走 /home/vllm，26.7.1 支持 -p
+conda create -n vllm312 python=3.12 pip -y $MIRROR    # 默认落点 /mnt/share/vllm/conda_envs/vllm312（系统盘，不推荐）
+conda create -p /home/vllm/x00886548/envbuild/envs/vllm312 python=3.12 pip -y $MIRROR   # 大环境走 /home/vllm，26.7.1 支持 -p
 conda activate /home/vllm/x00886548/envbuild/envs/vllm312     # 按绝对路径激活，CONDA_PREFIX 正确（已实测 bi_0921）
 ```
-验证：`ls -d /mnt/share/vllm/conda_envs/vllm312` 存在；新环境 `conda-meta/history` 的 `# cmd:` 行含 `mirrors.nju.edu.cn`（不含 = 走了官方源，重建）；`-p` 路径环境则校验 `conda activate <该目录>` 后 `$CONDA_PREFIX` = 该目录。
+验证：`ls -d /mnt/share/vllm/conda_envs/vllm312` 存在；新环境 `conda-meta/history` 的 `# cmd:` 行含 `mirrors.nju.edu.cn`（不含 = 走了官方源，重建）；`-p` 路径环境则校验 `conda activate <该目录>` 后 `$CONDA_PREFIX` = 该目录；**并且 `$ENVP/bin/pip -V` 必须能打印出指向 `<ENVP>` 的 pip**（只验 `python -V` 会漏掉下面那条坑）。
+
+- **`pip` 必须显式写进包列表（2026-10-10 实测）**：`conda create -p <ENVP> python=3.12` **不一定把 `pip` 放进 env**，而"`<ENVP>/bin/pip -V` 能打印"又常被当成环境验收判据 ⇒ 不写 `pip` 会得到"环境建好了、验收却过不了"（更糟的是拿别的解释器的 pip 装到错的 site-packages 里）。**写法：`conda create -p <ENVP> python=3.12 pip -y $MIRROR`**；验收 = `$ENVP/bin/pip -V` 第一行指向 `<ENVP>/lib/python3.12/site-packages/pip`。
 
 > 上面这几个路径是**可直接粘贴的实例**。`<name>` / `<user>` / `<ENVP>` 这类尖括号写法在 bash 里是**重定向符**，照抄进 shell 会报语法错或截断文件——要替换就替换成真实值，别把尖括号一起粘进去。
 
@@ -87,8 +89,9 @@ MIRROR="--override-channels -c https://mirrors.nju.edu.cn/anaconda/pkgs/main -c 
 L=/home/vllm/x00886548/envbuild
 ENVP=$L/envs/vllm312                                 # ← 换成你自己的环境目录（别写 <...> 占位符，bash 会当重定向报语法错）
 export CONDA_PKGS_DIRS=$L/conda_pkgs                 # ★ 必加：把包缓存也改道，否则会写系统盘的 pkgs_dirs
-conda create -p "$ENVP" python=3.12 -y $MIRROR
+conda create -p "$ENVP" python=3.12 pip -y $MIRROR
 $ENVP/bin/python -V
+$ENVP/bin/pip -V                                     # pip 没进 env 时这里会失败，见步骤 4 上面那条坑
 ```
 
 下发与判完成（**看产物，不看进程**）：
@@ -106,6 +109,7 @@ $L/envs/vllm312/bin/python -V
 - **`export CONDA_PKGS_DIRS` 不能省（2026-10-08 修）**：共享 `.condarc` 里 `pkgs_dirs` 是 `/mnt/share/vllm/conda_pkgs`（在系统盘上），而 **`conda create -p` 只改环境落点、不改包缓存落点**——不显式改道，这条 lane 就会往系统盘写几百 MB 到 GB 的解包缓存，「写盘白名单只给自己那一格」在物理上不成立。改道后这条 lane 的两个落点都在 `/home/vllm` 下。
   - 仍有一处**不在白名单内**但可忽略：conda 会把新 prefix 登记进 `~/.conda/environments.txt`（几十字节、落 `/root` 即系统盘）。这是 conda 的固定行为，不值得为它扩权（**机制推断，未实测**）。除它之外，`conda create -p` 不写 `.condarc`（只读）、也不走 `envs_dirs`/`CONDA_ENVS_PATH`。
 - **环境落点也必须在 `/home/vllm`**（`-p` 显式指定）：`conda create -n` 的默认落点是 `/mnt/share/vllm/conda_envs`（系统盘），大环境会把 `/` 推满。
+- **多 lane 并行时，不能拿 `$ROOT/log/lane_pids` 的行数判"有没有重复实例"（2026-10-10 实测）**：它是**各 lane 共享的 append 文件**（`ascend-env` §3.3 记的就是它），行数只等于"被记录过几次"，与"现在有几个实例在跑"无关。**判重复要对每条 lane 自己的日志做特征计数**——脚本里给本 lane 打一个唯一开始标记，然后 `grep -c 'P2 START' $L/lane_p2_conda.log` **必须 == 1**；`>1` 就是真起了两个实例（本轮实测出现过两个同名长任务实例互抢同一个日志文件、新实例截断旧日志，据此误判过"旧实例已死"，见 `ascend-env` §5 末）。
 
 ### 步骤 5：pip 源
 ```bash

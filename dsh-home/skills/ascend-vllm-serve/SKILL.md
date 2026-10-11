@@ -1,6 +1,6 @@
 ---
 name: ascend-vllm-serve
-description: 在昇腾 A3（.188/.190）上把装好的 vllm + vllm-ascend 跑起来——三层自检、按 HBM 挑空闲 die、vllm serve 起 OpenAI 兼容服务、离线推理冒烟、sleep/wake_up 显存释放与重载、运行时排障。适用于"在昇腾上起 vllm 服务 / 跑离线推理冒烟 / sleep mode 释放显存 / sleep level 1 还是 2 / wake_up 后输出乱码 / reload_weights 热更新权重 / 报 MemoryError 或 dtype or format of parameter / import torch_npu 报 No module named 'acl' / 服务起不来要定位 / 该占哪张卡用哪个端口 / 模型太大单卡放不下要 TP=2"。不适用：装/重装/编译 vllm-ascend → 用 `vllm-ascend-source-install`；栈装不上（torch_npu、pip） → 用 `ascend-torch-npu`。
+description: 在昇腾 A3（.188/.190）上把装好的 vllm + vllm-ascend 跑起来——三层自检、按 HBM 挑空闲 die、起 OpenAI 兼容服务、离线推理冒烟、sleep/wake_up 显存释放与重载、运行时排障。适用于"在昇腾上起 vllm 服务 / 跑离线推理冒烟 / sleep mode 释放显存 / sleep level 1 还是 2 / wake_up 后输出乱码 / reload_weights 热更新权重 / 报 MemoryError 或 dtype or format of parameter / import torch_npu 报 No module named 'acl' / 服务起不来要定位 / 别设 VLLM_TARGET_DEVICE / 该占哪张卡用哪个端口 / 模型太大单卡放不下要 TP=2"。不适用：装/重装/编译 vllm-ascend → 用 `vllm-ascend-source-install`；栈装不上（torch_npu、pip） → 用 `ascend-torch-npu`。
 whenToUse: 环境已装好、现在要真的跑模型时才用：起 OpenAI 兼容服务、跑离线推理冒烟、sleep/wake_up 与权重热更新，或服务起不来要定位；装的过程见 vllm-ascend-source-install。模型看不到本节。
 ---
 
@@ -15,7 +15,7 @@ whenToUse: 环境已装好、现在要真的跑模型时才用：起 OpenAI 兼�
 - 在 `192.168.13.188`（文档里代称 `a3`，但 ssh 用 IP，见「前置检查」）上 `vllm serve` 或 `LLM()` 跑模型；`.190`（`a3b`）同理但 ssh 易假死。
 - 要 `sleep()` / `wake_up()` 释放显存，或要 `reload_weights` 热更新权重（见步骤 3.1）。
 - 报 `MemoryError`、`dtype or format of parameter`、`NnopbaseExecutorDoTiling`、`No module named 'triton.experimental'`、`Engine core initialization failed`、`AttributeError: module 'vllm.v1.engine.utils' has no attribute 'get_physical_gpu_ids_for_local_dp_rank'`。
-- **KDA / 线性注意力系模型（Kimi-K3、GLM5next）起不来**：报 `ModuleNotFoundError: No module named 'fla_npu'`、`Error in inspecting model architecture`、`Model architectures ['KimiK3ForConditionalGeneration'] failed to be inspected.` → 见下文「KDA 系模型（Kimi-K3 / GLM5next）的隐藏硬依赖 `fla_npu`」一节（含 glibc 闸门）。
+- **KDA / 线性注意力系模型（Kimi-K3、GLM5next）起不来**：报 `ModuleNotFoundError: No module named 'fla_npu'`、`Error in inspecting model architecture`、`Model architectures ['KimiK3ForConditionalGeneration'] failed to be inspected.` → 见下文「KDA 系模型（Kimi-K3 / GLM5next）的隐藏硬依赖 `fla_npu`」一节（含 glibc 闸门）。**注意：不是所有 GLM 5.x 都需要 `fla_npu`——先查 `config.json` 的 `model_type`，`glm_moe_dsa`（GLM-5.2）不需要**。
 - 共享机上要决定占哪张 die、用多少显存、用哪个端口。
 - **起服务前的容量规划**（这个 MoE 模型要几张卡、EP/TP/DP 怎么配、64GB 卡真实预算 56.378 GiB 够不够） → 用 `ascend-moe-ep-capacity-planning`（本 skill 从"已经决定要起"开始）。
 
@@ -229,6 +229,20 @@ ss -ltnp | grep :18000 || echo "PORT RELEASED"
 
 ## KDA 系模型（Kimi-K3 / GLM5next）的隐藏硬依赖 `fla_npu`
 
+### ⚠️ 先判「会不会真走进 KDA / GDN 导入链」，再判 `fla_npu` 是否必需
+
+**别把本节读成「所有 GLM 5.x 都要 `fla_npu`」——那是误读。** 上手第一步是查该模型的 HF / ModelScope `config.json`，用 `model_type` / `architectures` **反查它会 import 到哪条链**，再决定要不要 `fla_npu`：
+
+| `config.json` 的 `model_type` / `architectures` | 实际走哪条路 | `fla_npu` |
+|---|---|---|
+| `glm_moe_dsa` / `GlmMoeDsaForCausalLM`（**GLM-5.2** 实测：HF `zai-org/GLM-5.2`） | `vllm_ascend/models/deepseek_mtp.py:AscendGlmMoeDsaForCausalLM`，**不经过 `glm5next`** | **不需要** |
+| Kimi-K3（`KimiK3ForConditionalGeneration`） | `vllm_ascend/ops/kimi_kda.py` | 需要 |
+| `glm5next`（= **GLM-5.3-Flash**，**不是** GLM-5.2） | `models/glm5next/…` → `.kda` → `ops/causal_conv1d` | 需要 |
+
+- `fla_npu` 只被这 4 处**无条件**模块级 import：`vllm_ascend/models/glm5next/ops/causal_conv1d.py:6`（导入链 `glm5next/model.py:81 -> .kda -> ops.causal_conv1d`）、`vllm_ascend/ops/kda.py:11`、`vllm_ascend/ops/kimi_kda.py:15`、`vllm_ascend/ops/gdn.py:23,60`。**没走进这条链的模型不需要 `fla_npu`**。
+- `glm5_next` ≠ GLM-5.2 的判据：同仓 `vllm_ascend/patch/__init__.py:269` 逐字写着 "The GLM-5.3-Flash architecture is maintained in vllm-ascend (`vllm_ascend/models/glm5next/`)"。
+- **下面整节的 glibc 闸门只对「真的走进 KDA / GDN 链」的模型成立**（Kimi-K3 系、GLM-5.3-Flash 系）；`glm_moe_dsa`（GLM-5.2）这一类**不需要** `fla_npu`，与 glibc 闸门无关。
+
 **本节记录的是「判据与闸门」，并且已在容器路线端到端验证通过**（起服务 + `/v1/models` 200 + `/v1/chat/completions` 200，见「出路 ③ 落地」一节的逐字实测）。**但宿主机那条路线确实走不通**：`.188` / `.190`（glibc 2.28 / 2.31）上不可能装上 `fla_npu` —— **这一点没有被推翻**，被推翻的只是"只有换机器或自己编两条路"。
 
 ### 症状与报错锚点（在**检视模型架构**阶段就炸，不是运行时才炸）
@@ -375,7 +389,7 @@ python -c "import fla_npu.ops.ascendc; print('FLA_OK')"     # 实测打印 FLA_O
 **端到端实测（逐字，可直接当验收基线）**——容器 `k3c-s2` + 真实减层包 `/k3w/kimi_k3_reduced_4l`（`num_hidden_layers=4, num_experts=896, hidden_size=7168, bf16`）：
 
 ```text
-args = --dtype bfloat16 --max-model-len 512 --enable-eager --load-format dummy
+args = --dtype bfloat16 --max-model-len 512 --enforce-eager --load-format dummy
        --tensor-parallel-size 4 --enable-expert-parallel --gpu-memory-utilization 0.8
        --max-num-seqs 4 --trust-remote-code --served-model-name k3
        --additional-config {"weight_nz_mode": 0}
@@ -405,6 +419,7 @@ args = --dtype bfloat16 --max-model-len 512 --enable-eager --load-format dummy
    > 下面那条 `AttributeError: module 'vllm.v1.engine.utils' has no attribute 'get_physical_gpu_ids_for_local_dp_rank'` 的观测**只对"仍读取该变量"的 vllm 版本成立**：它记的修法 `export VLLM_VERSION=<tag>` 在 `v0.23.0` 上不可能生效，请改用 `VLLM_VERSION_OVERRIDE` 或核对配对版本（§5.1）。
    > 完整机理、~20 处受影响分支、以及一行预检命令见 `vllm-ascend-source-install` §5 与 §6 坑 10。
 5. **env 脚本默认 `VLLM_BATCH_INVARIANT=1`，慢 5.5 倍**。实测同模型同卡：BI=1 → load 20.8s / **27.87 toks/s**；`unset VLLM_BATCH_INVARIANT` → load 10.0s / **154.51 toks/s**（日志另有 `Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.`）。不要求批次不变性就先 unset。
+   > **要证「BI 下结果真的批次不变」**（而不只是"BI 装上了"）→ 跑算子级验收配方：`vllm-ascend-source-install` §5.5（`torch.equal` 逐位比、参考必须是**同一个逻辑行**、空张量判 FAIL、负控；**正文归它，本文件只留指针**）。
 6. **共享机抢卡/显存**：`gpu_memory_utilization=0.4` 在小模型上仍一次吃 23 GiB KV（单 die 共 61.28 GiB）；一个进程只占一张卡，先按步骤 1 挑 free 最大的 die，别拉满利用率。
 7. **无害噪声**（别当故障）：`/root/.bashrc: line 36: /usr/local/Ascend/ascend-toolkit/set_env.sh: No such file or directory`（每条 ssh 都打）、`[W NPUCachingAllocator.cpp:202] Warning: The current CANN and HDK(driver) versions require processing for 32 padding size, with memory allocation. (function operator())`、`WARNING [parallel_state.py:2092] torch._C._host_emptyCache() only available in Pytorch >=2.5`、`WARNING [utils.py:1404]` 与 `WARNING [platform.py:1067] GPU-specific parameter is not supported on Ascend`、`[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0`（**单卡时正常**）、`VLLM_USE_V1 not set, auto-detected`。
 8. **思考型模型的 CoT 会写进 `content`，别误判成"没输出答案"**（2026-09-28 在 `.188` 实测）：`max_tokens=48` / `256` 时 `choices[0].message.content` 全是 `Thinking Process:` 之类的推理过程、`finish_reason=length`，**看起来像失败，其实是正常行为**。要给最终答案就把 `max_tokens` 放到 **≥1000**（实测 1200 才吐出最终答案；一次请求约 55s）。所以**冒烟判据只能写成「HTTP 200 且 `content` 非空」**，不要断言 content 里就是答案本身、也不要因为 `finish_reason=length` 判服务异常。
@@ -439,11 +454,16 @@ args = --dtype bfloat16 --max-model-len 512 --enable-eager --load-format dummy
     → 原因：为了挂一个额外包写成 `export PYTHONPATH=/some/dir`，把 CANN 原本在 `PYTHONPATH` 里的搜索路径**覆盖**掉了（`acl` 就在那里）。
     → 修法：**追加式**写法 `export PYTHONPATH=/some/dir:${PYTHONPATH:-}`（`:-` 兜住空值）。归因：这不是 CANN 装坏，别去重装（CANN 路径真相见 `ascend-cann-env`）。
 
+20. **运行期 `export VLLM_TARGET_DEVICE` → 平台层**静默**降级，三层自检的第 ③ 层就此假失败**（2026-10-10 实测）。
+    → 原因：只要该变量 == `cpu`，`vllm/vllm/platforms/__init__.py` 会在**咨询任何平台插件之前**就 `return` cpu 插件 ⇒ 平台层退化成 `UnspecifiedPlatform`（机理、源码行号与配方见 `vllm-ascend-source-install` §5.3，**单一归属**）。构建期的 `VLLM_TARGET_DEVICE=empty` 是**另一回事**（让 `ext_modules=[]`），与运行期**无关**，别顺手把它带进运行 shell。
+    → 修法：**运行期 `unset VLLM_TARGET_DEVICE`**——一键激活 / env 脚本里都**不要** export 它。干净态自检实测：`TARGET_DEVICE_ENV None` + 平台层 `NPUPlatform npu`。
+
 ## 不要做什么
 
 - 不要 `pip install`/卸载任何包；不要 `pip install -U triton`；不要重建 vllm。
 - 不要设 `VLLM_USE_V1`（已废弃）。**`VLLM_VERSION` 要按版本区分、不要无条件设也不要无条件不设**：vllm `v0.23.0` 上它**已不被读取**（真开关 `VLLM_VERSION_OVERRIDE`），且不导它时 `vllm_version_is("0.23.0")` 本来就 `True`——见本文件坑 4 的二次修正与 `vllm-ascend-source-install` §5.1。
 - 不要 `pkill -f vllm`；不要动 `/mnt/share/x00886548/cann/`、`/usr/local/Ascend`、`/etc/Ascend`、`xmz_0921` 里的包。
+- 不要 `export VLLM_TARGET_DEVICE`（运行期只要它是 `cpu` 就把平台层静默降级成 `UnspecifiedPlatform`，见坑 20）；构建期的 `VLLM_TARGET_DEVICE=empty` 与运行期无关，别带进来。
 - 不要在共享机上占用**未确认空闲**的 die、也不要起自己放不下的模型；**「别占多张卡」不是绝对禁令**——TP≥2 要同时占两张，但前提是 launch 前一刻确认两张都空闲（见步骤 1 与 4.1）；`gpu_memory_utilization` 别无脑拉满（TP=2 实测可用 0.85，留基线余量给别人）。
 - 不要把大文件/日志写 `/`、`/mnt/share`、`/tmp`、`/root`（同一块系统盘，长期紧张，余量现场 `df -h` 看）；写 `/home/vllm/x00886548/serve_test/`。
 - 内联 ssh 里别用 `<` `"` `$()`；脚本里别用 heredoc（会永久挂起）。

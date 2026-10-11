@@ -1,6 +1,6 @@
 ---
 name: ascend-server-layout
-description: 昇腾服务器目录地图与磁盘红线——找模型在哪、磁盘满了该写哪个盘（a3=.188 默认 / a3b=.190 备用）——.188 只有两块真盘：系统盘 /（/mnt/share、/mnt/weight、/tmp、/root 全压在它上面，多租户共用、长期紧张）与独立大盘 /home/vllm（大文件与大环境唯一推荐落点）；**不记剩余空间数字，动手前现场 df -h 取**；模型分两处（/mnt/weight + /home/vllm/weights），另有工作目录约定与现成环境；npu-smi 看 16 个 Ascend910 判空闲，Process 段列的是 NPU id 不是 die id（判 die 要用 Bus-Id）。适用于"找模型在哪 / 新项目和大文件该写哪个盘 / 磁盘满了 / 看哪张 NPU 空闲 / npu-smi 判哪张卡忙 / 复用现成环境 / 工作目录在哪"。不适用：装或换 CANN 版本 → 用 `ascend-cann-env`；conda 环境与 python 版本 → 用 `ascend-conda-env`。
+description: 昇腾服务器目录地图与磁盘红线——找模型在哪、磁盘满了该写哪个盘（a3=.188 默认 / a3b=.190 备用）——.188 只有两块真盘：系统盘 /（/mnt/share、/mnt/weight、/tmp、/root 全压在它上面，多租户共用、长期紧张）与独立大盘 /home/vllm（大文件与大环境唯一推荐落点）；**不记剩余空间数字与空闲 die 号，动手前现场 df -h / npu-smi 取**；模型分两处（/mnt/weight + /home/vllm/weights），另有工作目录约定与现成环境；npu-smi 判空闲，Process 段是 NPU id 不是 die id（判 die 用 Bus-Id）。适用于"找模型在哪 / 新项目和大文件该写哪个盘 / 磁盘满了 / 看哪张 NPU 空闲 / npu-smi 判哪张卡忙 / 复用现成环境 / 工作目录在哪"。不适用：装或换 CANN 版本 → 用 `ascend-cann-env`；conda 环境与 python 版本 → 用 `ascend-conda-env`。
 whenToUse: 上机第一步——确认模型与权重在哪、新项目和大文件该写哪个盘、哪张 NPU 空闲、能否复用现成环境时。CANN 见 ascend-cann-env，conda 见 ascend-conda-env，起服务挑卡见 ascend-vllm-serve。模型看不到本节。
 ---
 
@@ -16,7 +16,7 @@ whenToUse: 上机第一步——确认模型与权重在哪、新项目和大文
 - 不知道模型 / 权重在哪，或不知道工作目录约定、要新建项目目录。
 - 磁盘告警（系统盘快满，`df -h` 见红）、要判断"这个大文件能写哪"。
 - 想复用现成环境（`env_batch_inv.sh` / `xmz_0921`）而不是从零搭。
-- 要看哪张 NPU 空闲，或怀疑卡被别人占了。
+- 要看哪张 NPU 空闲，或怀疑卡被别人占了。**判空闲只认现场 `npu-smi info` 的 `HBM-Usage`——本文件不记、也不许引用任何固定空闲 die 号**（空闲 die 面两小时内能变三次，见步骤 4 ★ 与坑 9）。
 
 **不要用本 skill（转交）：**
 - 要装 / 换 / 查 CANN 或版本不对 → 用 `ascend-cann-env`。
@@ -111,9 +111,11 @@ ssh -n root@192.168.13.188 "source /mnt/share/x00886548/workspace/batch_inv_qwen
 ssh -n root@192.168.13.188 "npu-smi info | head -14; echo ===; npu-smi info | tail -30; echo ===; uptime; who | wc -l"
 ```
 - **判空闲**：`HBM-Usage(MB)` 形如 `used / 65536`。`used ≈ 2900–3200` 且 `AICore(%) = 0` = **空闲**（~3G 是驱动基线）；`used` 上万 = 有负载；再核对进程段该 NPU 是否列出 `Process id/name`。
+- ★ **不要记录、也不要向任何人给出"固定的空闲 die 号"**（这是步骤 1「不记剩余空间数字」在 **die 维度**上的同一条纪律）。空闲 die 面**变化极快**：2026-10-10 实测同一台 `.188` **两小时内至少变三次** —— 10:21 空闲仅 `Phy 8~15`；10:59 见到 `Phy 0~3`（其中 **4 已被占**，51652/65536）；11:00 实拍空闲 `Phy 0,1,2,3,8~15` **共 12 张**，占用者是**他人作业**的 `VLLMWorker_TP`（各 ≈51 GB）。
+  ⇒ **判空闲只认现场 `npu-smi info` 的 `HBM-Usage`（明显低于 65536）**：与本文档、与上一次快照、与别人的结论**一律比对不得**；任何 die 号写进交付物/派活指令之前都要**当次重取**。
 - 2026-09-23 实测 `.188`：**只有 NPU 0 被占**（`| 0 | 0 | 174904 | VLLMWorker | 28907 |`，HBM 32123/65536），**NPU 1–7 全空闲**（HBM 2874/65536）。`ls /dev/davinci* | wc -l` = 17，`npu-smi info | grep -c 'Ascend910'` = 16。
 - ⚠️ **Process 段的 `NPU` 列是 NPU id、不是扁平 die id**（一张 NPU 含 2 个 chip/die）→ 拿那一列判"第几号 die 忙"会判错。
-- ⚠️ **读反的后果（2026-10-09 Lead 实测踩坑并勘误一次）**：照 Process 段**行首两列**（= `NPU id` + `Chip`，**不是 die id**）判"哪几个 die 空闲"，会**把忙/闲整批读反**——实测把 8/9/10 三张空 die 读成"忙"、把真正忙的读成"空闲"。**正确算法**：die 号取**主表的 `Phy-ID` 列**，再用 **`Bus-Id`** 对齐到 Process 段（就是下面那条）。本机实测真值：`Phy-ID` **8 / 9 / 10** 空闲（各 3102 / 2868 / 3108 MB of 65536）；**0–7 与 11–15 忙**（各约 56362–56657 / 65536，由 `VLLMWorker_TP` 每张占 53.5 GB、`VLLMEngineCor` 占 53513 持有）。
+- ⚠️ **读反的后果（2026-10-09 Lead 实测踩坑并勘误一次）**：照 Process 段**行首两列**（= `NPU id` + `Chip`，**不是 die id**）判"哪几个 die 空闲"，会**把忙/闲整批读反**——实测把 8/9/10 三张空 die 读成"忙"、把真正忙的读成"空闲"。**正确算法**：die 号取**主表的 `Phy-ID` 列**，再用 **`Bus-Id`** 对齐到 Process 段（就是下面那条）。本机**2026-10-09 一次快照**（**只是快照、不是固定答案**，见上一行 ★）：`Phy-ID` **8 / 9 / 10** 空闲（各 3102 / 2868 / 3108 MB of 65536）；**0–7 与 11–15 忙**（各约 56362–56657 / 65536，由 `VLLMWorker_TP` 每张占 53.5 GB、`VLLMEngineCor` 占 53513 持有）。
 - ⚠️ **误读的来源**：进程是**按 NPU 粒度**报的（一个 NPU 含 2 个 die）——对 NPU 4 跑 `npu-smi info` 会打印 `No running processes found`，看着像"整张 NPU 空"，**不能据此判 die 忙闲**，仍要回到 `Phy-ID` + `Bus-Id`。**后果举例**：把验收任务派到忙 die 上会 OOM，而该 OOM **不是环境问题**，极易被误判成"环境没搭好"。
 - **要判某个物理 die 上有没有进程，用 HBM 段的 `Bus-Id`**（形如 `0000:F4:00.0`）唯一匹配最稳：同一个 Bus-Id 在 NPU 段、HBM 段、Process 段都能对上，不受 id 编号口径影响。
   - 验证：`npu-smi info | grep -n 'Bus-Id'` 先定位 HBM 段，再拿该 Bus-Id 去 Process 段反查有无同名行。
@@ -143,6 +145,7 @@ NAME=qwen3-32b
 | 6 | `ssh root@192.168.13.188` stderr 每次一行 `/root/.bashrc: line 36: /usr/local/Ascend/ascend-toolkit/set_env.sh: No such file or directory` | 真实断链（`latest -> /usr/local/Ascend/cann-9.1.0/cann` 不存在）。**默认路径的噪声，忽略**；CANN 用 `/mnt/share/x00886548/cann/cann_9_1_0`，见 `ascend-cann-env` |
 | 7 | `ssh root@192.168.13.190` → `ssh_dispatch_run_fatal: Connection to 192.168.13.190 port 22: Connection timed out` | 2026-09-23 实测 9 次尝试 / 约 5 分钟（`ConnectTimeout=20/25`、`ServerAliveInterval=5`、间隔 5s 循环）**全部失败，一次 hostname 都没拿到**。**`.190` 全部条目标「未复核」，不得编造**；重试或降级用 `.188` |
 | 8 | `/home/vllm/weights` 归 root 但同盘混着他人目录（`skhalid` 699G / `w00893744` 331G / `fyf` 123G） | **写自己的东西前先确认命名空间**，一律用 `/home/vllm/x00886548/`，别覆盖同名他人目录 |
+| 9 | 照抄"上一轮哪几张 die 空闲"去挑卡 → 挑到别人刚占上的 die（`.188` 实测**两小时内空闲 die 面至少变三次**：`Phy 8~15` → 含 `0~3`（4 已被占 51652/65536）→ `0,1,2,3,8~15` 共 12 张） | **不记、也不信任何固定 die 号**：动手前现场 `npu-smi info`，只按 `HBM-Usage`（明显低于 65536）判空闲，并用 `Bus-Id` 对齐复核；写进派活指令前再取一次 |
 
 ## 不要做什么
 
@@ -158,6 +161,6 @@ NAME=qwen3-32b
 1. `ssh -n root@192.168.13.188 "df -h /mnt/weight /home/vllm"` 输出的挂载点分别是 `/` 与 `/home/vllm`；**剩余空间数字现场取、不与文档比对**（本文件故意不记数字），并能说出当前余量大概是多少。
 2. 你能说出"新权重该写 `/home/vllm/weights/<name>`"，并给出该路径的 `df -h` 证据。
 3. 模型盘点命令返回 `/mnt/weight` 3 个 + `/home/vllm/weights` 6 个以上目录，LFS 判别 `grep -c git-lfs` = 0。
-4. `npu-smi info` 能读出 16 个 `Ascend910`，并明确报出"哪几个 NPU 的 HBM ≈ 3000/65536 且 AICore 0"（= 空闲）。
+4. `npu-smi info` 能读出 16 个 `Ascend910`，并明确报出"哪几个 NPU 的 HBM ≈ 3000/65536 且 AICore 0"（= 空闲），**且把这些 die 号标注成"现场快照"**——交付物里不得出现"固定空闲 die 号"（见步骤 4 的 ★ 条）。
 5. `source .../batch_inv_qwen35/env_batch_inv.sh` 后 `python -c "import vllm, torch_npu"` 无报错。
 6. 交付中每条 `.190` 事实都带「未复核」，每条推断都带「未验证：」。

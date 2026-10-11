@@ -1,6 +1,6 @@
 ---
 name: ascend-cann-env
-description: 昇腾 CANN 的检测/安装/激活/换版本/卸载（默认 a3=192.168.13.188，备用 a3b=.190）——权威定位看 /etc/Ascend/ascend_cann_install.info，toolkit+ops+nnal 三件套安装序列与耗时，合一包不覆盖驱动，公开源最高 9.2.0-beta.2（桶内目录名是 CANN 9.2.T3，按版本号猜目录必 403）。适用于"装/换/查 CANN / import acl 或 atc 报找不到 CANN / source set_env.sh 后 ASCEND_HOME_PATH 为空 / install.info 里还记着旧路径 / 重跑安装脚本报 Permission denied / 该用合一包还是独立 toolkit 包 / 某个 CANN 版本公开源有没有 / OBS 探版本全是 403"。不适用：conda 与 python 版本 → 用 `ascend-conda-env`；目录与磁盘红线 → 用 `ascend-server-layout`。
+description: 昇腾 CANN 的检测/安装/激活/换版本/卸载（默认 a3=192.168.13.188，备用 a3b=.190）——权威定位看 /etc/Ascend/ascend_cann_install.info，toolkit+ops+nnal 三件套安装序列与耗时，合一包不覆盖驱动，公开源最新非 beta = 9.1.1，beta/T 构建桶内目录名 ≠ 版本号（如 CANN 9.2.T3）。适用于"装/换/查 CANN / import acl 或 atc 报找不到 CANN / source set_env.sh 后 ASCEND_HOME_PATH 为空 / install.info 里还记着旧路径 / 重跑安装脚本报 Permission denied / 该用合一包还是独立 toolkit 包 / 某个 CANN 版本公开源有没有 / OBS 探版本全是 403"。不适用：conda 与 python 版本 → 用 `ascend-conda-env`；目录与磁盘红线 → 用 `ascend-server-layout`。
 whenToUse: 要在 192.168.13.188/.190 上查 CANN 装在哪、什么版本，装或重装 CANN（9.1.0 / 9.2.0-beta.2），切版本、修 CANN 环境变量，判断该用合一包还是独立 toolkit 包，或要确认某个 CANN 版本在公开 OBS 上到底有没有时使用。模型看不到本节。
 ---
 
@@ -13,7 +13,7 @@ whenToUse: 要在 192.168.13.188/.190 上查 CANN 装在哪、什么版本，装
 **加载本 skill 当：**
 - 要查「CANN 装在哪 / 什么版本 / 机器上有几份」，或 `import acl`、`atc`、算子编译报找不到 CANN。
 - 要装 / 重装 / 换路径 / 换版本 / 卸载 CANN（9.1.0 或 9.2.0-beta.2；toolkit、ops、nnal 三件套）。
-- 要确认某个 CANN 版本在公开 OBS 上到底有没有（**桶内目录名 ≠ 版本号**，按版本号猜目录去探必然 403，见坑 11）。
+- 要确认某个 CANN 版本在公开 OBS 上到底有没有（**桶内目录名 ≠ 版本号，但这条只对 beta/T 构建成立**——正式版目录名就是版本号，见坑 11）。
 - `source set_env.sh` 之后 `ASCEND_HOME_PATH` 为空，或指向已不存在的目录。
 
 **不要用本 skill（转交）：**
@@ -140,7 +140,7 @@ cd ${P%/cann_9_1_0}/nnal && ./nnal_uninstall.sh    # nnal（nnal 与 toolkit 同
 10. **`usergroup=root not right!`**（官方附录 C）：非 root 登录后 `su` 到 root 安装时 `USER` 仍是原用户 → `export USER=root` 后再装。
 11. **公开下载源**：唯一可直连源 = `https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/<桶内目录名>/`（匿名只读；`-H "Referer: https://www.hiascend.com/"` **非必需**，2026-10-08 实测带/不带都 200）；`mirrors.huaweicloud.com/ascend/` 只托管 yum/apt 包，**不托管 run 包**。**合一包 `Ascend-cann_9.1.0_linux-x86_64.run` 不在公开桶**（403）→ 只用公开源时走「独立 toolkit 包」那支。
 
-    **⚠️ 桶内目录名 ≠ 版本号（2026-10-08 实测，这是判 403 的头号原因）**：9.2.0-beta.2 的目录是 **`CANN 9.2.T3`**，**不是** `CANN 9.2.0-beta.2`。按版本号猜目录名去探必然 403，会被误判成「该版本不存在」——旧记录「最高版本 = 9.1.0，9.2.0-beta.1/2 全 403」**就是这么得到的，已被证伪**。
+    **⚠️ 桶内目录名 ≠ 版本号 —— 这条只对 beta/T 构建成立，正式版目录名就是版本号**（2026-10-08 首测，2026-10-10 收窄复测）：9.2.0-beta.2 的目录是 **`CANN 9.2.T3`**，**不是** `CANN 9.2.0-beta.2`；而**正式版 9.1.0 的目录就叫 `CANN 9.1.0`**（`CANN%209.1.0/...` 直接命中 **200**）⇒ **只有 beta/T 构建需要按 T 号换名，正式版按版本号猜目录是"对的"**。但**别把"按版本号猜目录必 403"还在正式版上照搬**：旧记录「最高版本 = 9.1.0，9.2.0-beta.1/2 全 403」正是拿版本号当目录名去探 beta 得到的，**已被证伪**。
 
     | 探针（同批必须混入一个**已知存在**的对照对象，否则 403 分不清"无权限/目录错/不存在"） | 结果 |
     |---|---|
@@ -149,7 +149,8 @@ cd ${P%/cann_9_1_0}/nnal && ./nnal_uninstall.sh    # nnal（nnal 与 toolkit 同
     | `CANN 9.2.T3/Ascend-cann-toolkit_9.2.0_linux-x86_64.run`（商发名，无 `-beta`） | 403 |
     | `CANN 9.2.0/Ascend-cann-toolkit_9.2.0_linux-x86_64.run` | 403 |
 
-    → **公开源最高版本 = 9.2.0-beta.2（社区版）**；**9.2.0 商发（无 `-beta`）公网确实不存在**（同一目录下 403，对照 beta.2 = 200），内网/商发渠道包才可能有。用户点名"9.2.0 商发"时要**先说明这一点**再决定用 beta.2。
+    → **公开源版本号最高 = 9.2.0-beta.2（社区版 / 预发布）**；**9.2.0 商发（无 `-beta`）公网确实不存在**（同一目录下 403，对照 beta.2 = 200），内网/商发渠道包才可能有。用户点名"9.2.0 商发"时要**先说明这一点**再决定用 beta.2。
+    → **另：9.1.0 不是最新**（2026-10-10 实测）——公开源更新的**非 beta** 版是 **9.1.1**（目录名就是 `CANN 9.1.1`，OBS 实测 **200** / `1301221019 B` / 2026-09-01 构建）⇒ 要「最新的稳定版」选 **9.1.1**，要「最高版本号」才是 9.2.0-beta.2。**"最高 beta" ≠ "最新"**，用户说"最新"时先问清是哪一种。
 
     **9.2.0-beta.2 三包实测（2026-10-08，`CANN 9.2.T3/`；安装序列、参数、`-q` 行为与 9.1.0 完全一致，直接套用步骤 0~7）**：toolkit `1398240001 B` md5 `6b5a5dc6d3cf9e9fcf680bf4684906cf`；A3-ops `2533705704 B` md5 `d58d77bed571aa7561c547a454ffbbfe`；nnal `440760339 B` md5 `5e4eb1a4749490a20f8c0808b20855f2`。落盘形态同 9.1.0：`cann-9.2.0-beta.2/`（`opp/` 在它下面）+ `cann` / `ascend-toolkit` 兼容软链 + `nnal/`；`ASCEND_HOME_PATH=<p>/cann-9.2.0-beta.2`；`<p>/ops` 同样**不会**产生。**toolkit 的 OBS ETag 就等于 md5** → 判「下完没」可先读 `curl -I` 的 ETag，不必等下完再 `md5sum`。
 
@@ -169,11 +170,14 @@ cd ${P%/cann_9_1_0}/nnal && ./nnal_uninstall.sh    # nnal（nnal 与 toolkit 同
    wait
    ls -l "$PKGS"/*.run
    ```
-   - 体积 / md5（判"下完没"只看这个，**不看进程**）：toolkit `1298337341 B` md5 `bc4f2b6a09fe94f7891f946590c52c2c`；nnal `572750476 B` md5 `f8918a5b8fcec5809df45c1b87469449`；A3-ops `2363708646 B`（无 md5 记录）。
+   - 体积 / md5 / sha256（判"下完没"只看这个，**不看进程**）：toolkit `1298337341 B` md5 `bc4f2b6a09fe94f7891f946590c52c2c` / sha256 `69e52e49a5ac1dde756a0d72077e36df7382b37cd3e1d78005d9cdbf699aeafc`；nnal `572750476 B` md5 `f8918a5b8fcec5809df45c1b87469449` / sha256 `1a743a0957a77a0624c2ecfdf689b5c5937a9097fda1e3b3e8e0191a7d11c694`；A3-ops `2363708646 B`（无 md5 记录）/ sha256 `7449e7151c7c3a1c23f2eed6978699b3bb3602ca2662e653cec51da2ab0f61ee`（三个 sha256 均 2026-10-10 实测，可作为"下完没"的第二判据）。
    - **并行只能 `&` + `wait`，别指望下载器**（2026-10-08 实测）：`.188` 上 `aria2c` / `axel` **不存在**，`curl` 是 **7.64**，该版本的 `--parallel` 与 `-Z` **都不支持**（`curl --parallel UNSUPPORTED` / `curl -Z UNSUPPORTED`）；`wget` 有，但要并行同样得自己 `&`。实测三条并发 HEAD 同时返回 200。
    - `-C -` 断点续传：重跑同一条命令即续传，不从头再来（4.2G 量级值得留着）。
    - **这条 lane 与 CANN 安装完全解耦**：下载完可以先搁着，安装（上面步骤 2~5）等 4 条 lane 的 barrier 之后再统一做；它也可与 conda 建环境 / torch 栈 whl 预下载 / 两仓 clone 同时跑。全程编排见 `ascend-env` §3.1。
-   - **该桶缺对象返回 403 而不是 404**，列桶也 403 → 探版本时必须同批混入一个**已知存在**的对照对象（否则会把「无权限」当「不存在」）。
+   - **文件名大小写敏感**（2026-10-10 实测）：9.1.0 的 A3 算子包是**大写 `Ascend-cann-A3-ops_9.1.0_linux-x86_64.run`** —— 小写 `a3-ops` = **403**，`Ascend-cann-kernels-910b_` = **403**；名字对不上时 403 与"不存在"长得一模一样。合一包 `Ascend-cann_9.1.0_linux-x86_64.run` = **403**（不在公开桶，见坑 11 首段）。
+   - **该桶缺对象返回 403 而不是 404**（响应头 `x-obs-error-code: AccessDenied`），**列桶也全 403**（桶根、`?prefix=`、`?list-type=2` 都是 AccessDenied）⇒ 探版本时**同批必须同时混入正/负两种对照**（一个**已知存在**、一个**已知不存在**），否则分不清「无权限 / 目录名错 / 真不存在」，单靠一个 200 对照只能证"桶可达"，证不了"这个键不存在"。
+   - **想"列目录"就别用 OBS**（2026-10-10 实测）：`https://ascend.devcloud.huaweicloud.com/cann/run/software/` 是**可列的 Artifactory 索引**（真的 `Index of` 页面，与 OBS 同一批产物——A3-ops 长度两边都是 `2363708646`），找/核文件名用它比逐个探 OBS 快。
+   - **hiascend 文档站是 SPA，但 `/doc_center/source/zh/...` 直出静态原文**（如 `.../CANNCommunityEdition/910/softwareinst/instg/instg_0008.html`）——**同目录并非同规则**（实测 0003 / 0005 / 0008 = 200，0001 / 0002 / 0004 / 0006 / 0007 / 0009 = 403）⇒ 文档页只能**逐个探**，别按"同目录应该都能取"推断。
 
 12. **安装器的既有副作用 + 「注册表在运行时不被查询」**（2026-10-08 实测）：安装器会创建 `/etc/Ascend/<日期时间>` 备份目录（本轮实测 `/etc/Ascend/20261008_194804`）并改写全局注册表 `/etc/Ascend/ascend_cann_install.info`。把注册表恢复成**原值**（本轮恢复到指向**别人**的 `…/vllm_0230/cann/cann_9_2_0/cann-9.2.0-beta.2`）之后，这套新装的 CANN **依然完全正常**（`import acl` 得 `ACL_SOC Ascend910_9382`、真实推理成功）⇒ **注册表在运行时不被查询**，别把它当"跑不起来的原因"。`/root/.bashrc` **未被改动**（改动前后 md5 一致，本轮同为 `2a9409ac2cbfff2e64b05c3d866f711b`）。纪律：注册表 md5 **现场取 + 存档**（步骤 0），**不要硬编码**——历史正文里那种写死的期望值会随别人重装而失效。
 13. **CANN 的 `set_env.sh` 会污染 `PYTHONPATH`，把 `pip list` / `pip check` 搞花**（2026-10-08 实测）：它把 `.../cann-9.1.0/python/site-packages` 与 `.../cann-9.1.0/opp/built-in/op_impl/ai_core/tbe` 前置 ⇒ pip 会看到 CANN 自带的一堆发行包。本轮实测多出 **5 条噪声**（逐字）：

@@ -1,6 +1,6 @@
 ---
 name: vllm-ascend-source-install
-description: 从源码装 vllm + vllm-ascend 配对流程——main 按 `.github/vllm-main-verified.commit` 配 vllm（VLLM_TARGET_DEVICE=empty）；release tag 配同名 tag；VLLM_VERSION 在 v0.23.0 失效，改用 VLLM_VERSION_OVERRIDE；torch 家族 pin 先注释；VLLM_BATCH_INVARIANT 默认不导出。适用于"装或重装 vllm-ascend / release tag 配 vllm / 报 vllm_version_is 为 False / 报 ResolutionImpossible 或 numpy 冲突 / pip 卡在 llguidance / 复用已有 torch_npu / 报 build 依赖不满足"。不适用：起服务排障 → 用 `ascend-vllm-serve`；torch 栈装不上 → 用 `ascend-torch-npu`。
+description: 从源码装 vllm + vllm-ascend 配对流程——main 按 `.github/vllm-main-verified.commit` 配 vllm（VLLM_TARGET_DEVICE=empty）；release tag 配同名 tag；VLLM_VERSION 在 v0.23.0 失效，改用 VLLM_VERSION_OVERRIDE；torch 家族 pin 先注释；VLLM_BATCH_INVARIANT 默认不导出。适用于"装或重装 vllm-ascend / release tag 配 vllm / 报 vllm_version_is 为 False / 报 ResolutionImpossible 或 numpy 冲突 / pip 卡在 llguidance / 批次不变性怎么验 / 复用已有 torch_npu / 报 build 依赖不满足（nanobind）"。不适用：起服务排障 → 用 `ascend-vllm-serve`；torch 栈装不上 → 用 `ascend-torch-npu`。
 whenToUse: 要决定「怎么把 vllm 与 vllm-ascend 从源码装进已有环境」时用：按 verified commit 配对两仓、复用已装 torch 栈、编译 AscendC 算子。模型看不到本节。
 ---
 
@@ -16,6 +16,7 @@ whenToUse: 要决定「怎么把 vllm 与 vllm-ascend 从源码装进已有环�
 - 要把 vllm 与 vllm-ascend 用 `pip install -e .` 装进已有环境（或重装、换 commit），包括 `--no-build-isolation` 报 build dependencies 不满足。
 - 要按 vllm-ascend 当次 checkout 的 `.github/vllm-main-verified.commit` 配对 vllm 版本。
 - 不希望 pip 按 pin 换掉已装好的 torch / torch_npu / triton-ascend，或问要不要开 `VLLM_BATCH_INVARIANT`。
+- 要**验收批次不变性**：判"BI 装进去了没有" → §4.1 / §4.3；判"算子结果真的不随批构成变" → **§5.5**（算子级验收配方）。
 
 **不要用本 skill（转交）：**
 - 服务起不来、离线推理 / 冒烟 / 权重校验 / 运行时排障 → 用 `ascend-vllm-serve`（本 skill 只管「装得上」，不管「跑得起来」）。
@@ -224,7 +225,15 @@ export VLLM_BATCH_INVARIANT=1     # 构建期生效
   1. `site-packages/batch_invariant_ops*/` 与 `batch_invariant_ops_lib*.so` 的 **mtime 是本次构建**；
   2. `python -c "import vllm_ascend.batch_invariant as b; print(b.HAS_ASCENDC_BATCH_INVARIANT)"` 输出 `True`；
   3. CANN 侧 `…/cann-<ver>/cann-9.1.0/opp/vendors/batch_invariant/` 目录存在且 mtime 是本次。
+  > **构建期日志侧的独立判据**（run 包与 whl 包**各自的** `installed successfully` + `SOC_ARG=ascend910_93` + `ascend_install_rc=0`；必须看**成功那份**日志，且 SOC 行要 `-vv` 才拿得到）见 §4.3。
 - **属性在哪个模块，别探错地方**：`HAS_ASCENDC_BATCH_INVARIANT` 定义在 **`vllm_ascend.batch_invariant`**（源码 `vllm_ascend/batch_invariant.py` 顶部），**不在** `batch_invariant_ops` 模块上——对它 `import batch_invariant_ops` 去探只会得到 `?`，会被误判成"BI 没编进去"。反面探针：`dir(torch.ops.batch_invariant_ops)` **数不出算子**（实测只返回 1 个属性），别拿它当判据；要看绑定关系就读 `vllm_ascend/batch_invariant.py` 里把 `aten::mm` / `aten::matmul` 绑到 `torch.ops.batch_invariant_ops.npu_*_batch_invariant` 的那几行（其后是 triton 回退分支）。
+- **算子数：模块侧导出 11 个，被 vllm-ascend 注册的只有 4 个（2026-10-10 实测）**。`import batch_invariant_ops` 后 `dir(batch_invariant_ops)` 实测列出 **11** 个（**比源码里被注册的多**）：
+  `npu_mm_batch_invariant` / `npu_matmul_batch_invariant` / `npu_reduce_sum_batch_invariant` /
+  `npu_fused_infer_attention_score_batch_invariant`（含 `_out` / `_v2`）/ `npu_reduce_mean_batch_invariant` /
+  `npu_softmax_batch_invariant` / `npu_log_softmax_batch_invariant` / `npu_add_rms_norm_batch_invariant` /
+  `npu_fused_linear_online_max_sum_batch_invariant`；
+  而 `vllm_ascend/batch_invariant.py:142-148`（`:96` 是另一处注册点）实际注册的只有 **`mm` / `matmul` / `fused_infer_attention_score` / `reduce_sum` 四个**。
+  ⇒ **别拿"导出数 = 生效数"当判据**：多出来的算子只是被绑定出来，未必被 vllm-ascend 接进 `aten::` 分派。判生效读 `batch_invariant.py` 的注册行，不数 `dir()`（注意：`dir(batch_invariant_ops)` 是**模块侧**，与上一行那个"数不出算子的 `dir(torch.ops.batch_invariant_ops)`"不是同一个对象，别混）。
 
 ### 4.2 编 `vllm_ascend_C` 的编译器（torch 2.10 头文件要求 GCC ≥ 9）
 
@@ -251,6 +260,19 @@ export C_COMPILER=$CC CXX_COMPILER=$CXX    # vllm-ascend 自己的 envs.py 会�
 - ⚠️ **绝不把该 env 的 `bin` 前置进 `PATH`**：它是带自己 `python`/`pip` 的 conda env，前置后 `pip` 会解析到它的 pip，**把 vllm-ascend 装进错误的 conda env**（静默、后果严重）。只用 `CC`/`CXX` 的绝对路径指编译器。
 - 换过 torch 或改过 pin 后**必须 `rm -rf csrc/build build`**（§4 已含），否则 cmake 沿用缓存里的旧编译器。
 - **取证"这次用了哪个编译器"要看对地方**：`vllm_ascend_C` 的 cmake 跑在 setuptools 临时目录里，且 **pip 成功时不打印构建日志**；`csrc/build/CMakeCache.txt` 里的 `CMAKE_CXX_COMPILER=/usr/bin/c++` 属于 **aclnn/kernels 那套构建，不能用来判断 `vllm_ascend_C`**。可信取证：构建日志里 ninja 实际调用的 `g++` 路径，或新生成 `.so` 的 mtime（`ls -l --time-style=full-iso <env>/lib/python3.*/site-packages/vllm_ascend/*.so`）。
+
+### 4.3 ★ 重发 BI 构建前的硬门控（**能省一次 24 分钟编译**）
+
+AscendC 自定义算子的编译是**整条链路的最后一步**才失败（§4.1 / 坑 5 / 坑 15 那类 python 与依赖问题会一路拖到 cmake 的 `ops prepare build failed`）⇒ **在重新发起 `COMPILE_CUSTOM_KERNELS=1 VLLM_BATCH_INVARIANT=1` 之前，先跑这一条，`rc` 必须为 0**：
+
+```bash
+$ENVP/bin/python -c "import regex, torch, torch_npu, vllm"; echo "rc=$?"
+```
+
+- **为什么这四项必须都点名**：`regex` 是 `csrc/cmake/scripts/util/ascendc_impl_build.py:21` 的模块级 import（坑 6 的"cmake 选错 python"与坑 15 的"依赖没装齐"都以它现形）；`torch` / `torch_npu` 认的是编译期那一套；`vllm` 不在时报得更晚（`ops prepare build failed`）。**rc=0 才发编译；rc≠0 一律先修依赖**，否则整轮白跑（一次约 24 分钟）。
+- **取证要 `-vv`，`-v` 不够**：`[build_aclnn] resolved SOC_ARG=…` 这类行受 pip 的 verbose 级别控制，`used_level = VERBOSE(15)`（依据 `pip/_internal/utils/subprocess.py`）⇒ `-v` 打不出这类行，**要用 `-vv`**。
+- **失败尝试与成功那次写在不同的日志里**：判「BI 到底装上了没有」必须看**成功那一份**日志——本轮两份日志并存，只看失败那份会得出"没装上"的错结论。
+- **BI 成功的判据（三条都来自同一份成功日志）**：run 包与 whl 包**各自的** `[install_batch_invariant] ... installed successfully` + `SOC_ARG=ascend910_93` + `ascend_install_rc=0`。这三条都是**多词模式**，`grep` 时必须把模式写进 `.sh` 再推远端——为省引号裸写会**静默降级**（见 `ascend-env` §5）。
 
 ## 5. 验证（逐层来，别一上来就跑模型）
 
@@ -325,6 +347,24 @@ unset VLLM_TARGET_DEVICE        # 若为 cpu，在本 shell 清掉后重跑 §5 
 - **判自己的 entry_points 正常吗**：`grep -A2 'vllm.platform_plugins' $REF/lib/python3.*/site-packages/vllm_ascend-*.dist-info/entry_points.txt` → 实测 `ascend = vllm_ascend:register`，与本仓 `setup.py:507` **逐字相同**。
 - **判 `pip check` 的抱怨是不是噪声**：两边都有**逐字同一句** `opencv-python-headless 5.0.0.93 has requirement numpy>=2, but you have numpy 1.26.4` ⇒ 参考环境也有 = **既定噪声**（实测 `import cv2` 正常、版本 `5.0.0`）⇒ **不要动 opencv / numpy**，并再次确认 `pip check` **不是验收判据**（§6 坑 1b）。
 
+### 5.5 算子级批次不变性验收（"BI 装上了" ≠ "结果真的不随批构成变"；**本节是 BI 的验收配方**）
+
+§4.1 / §4.3 只证「BI 装进去了」。要证「同一个逻辑行在不同批构成下**逐位相同**」，跑这一层：
+
+- **自发现算子名，不编造**：算子名从 `dir(batch_invariant_ops)` 现取，拿不到就判 **SKIP**；**不要手写一个猜来的算子名当用例**。
+- **判据是 `torch.equal` 逐位相同，绝不用 `allclose`**：`allclose` 有容差，恰好会放过"差一点"的批次相关误差。
+- **必须先断言张量真在 NPU 上**：不在就判 **`SKIP(not-on-npu)`**，不要判 PASS——CPU 上跑出的"全 PASS"什么也证明不了。
+- **★ 唯一根因（旧写法全错在这条）：参考必须是"同一个逻辑行"**。旧写法把 `A[0]` 的输出当成第 r 行的参考 ⇒ 比的是**两个不同输入** ⇒ 全元素失配（实测 `max_abs_diff` **60~87**），并呈现**极具误导性**的形态：「**第 0 行恒 PASS、其它行恒 FAIL**」。正解是目标行单独成批算参考，**再把它置于批首**：
+  ```python
+  target = a_dev[r:r+1]                                        # 同一个逻辑行，单独一批 = 参考
+  rows = torch.cat([target, a_dev[0:r], a_dev[r+1:]], dim=0)   # 目标行置于批首
+  assert torch.equal(rows[0:1], target)                        # ★ 位级自检：先证明切片没写坏
+  ```
+  **位级自检 `torch.equal(rows[0:1], target)` 不能省**：它把"切片写坏"与"算子真的批次不变"分开；没有它，后面的 FAIL 无法归因。
+- **空张量比对必须判 FAIL**：`shape=(0,1)` 时两边"相等"会给出**假 PASS**（真原因通常是切片写坏）⇒ 检测到 `numel()==0` 直接判 **FAIL** 并标 `EMPTY`。
+- **负控（没有它整个测试等于空转）**：拿一个**故意做成批次非不变**的 CPU stub 跑同一套断言，必须报出 **FAIL**；**只报全 PASS 的测试不构成证据**。
+- **覆盖面，以及不许读作证据的东西**：`npu_fused_infer_attention_score_batch_invariant` **默认 SKIP**——它的张量布局在本地源码里查不到，凭猜调用 = 编造；即使加 `--allow-attn` 也**仍然 SKIP**，并报 **`EZ1008 ... When layout is TND, actualSequenceLengthQ is required`** ⇒ **这条不得读作"注意力算子批次不变"的证据**。
+
 ## 6. 高频坑
 
 1. **pin 没注释** → `--no-build-isolation` 下报 build dependencies 不满足，或 pip 把已装 torch 换版本（torch 与 torch_npu 强绑定，换错就 import 崩）。
@@ -354,6 +394,7 @@ unset VLLM_TARGET_DEVICE        # 若为 cpu，在本 shell 清掉后重跑 §5 
    - `prometheus-fastapi-instrumentator 8.1.0 has requirement starlette<2.0.0,>=1.0.0, but you have starlette 0.50.0.`
    ⇒ 判环境成功用**三层 import/NPU 检查 + 离线冒烟**（§5 + `ascend-env` §4），**不要**拿 `pip check` 干净与否下结论。
 5. 缺 build 依赖：`arctic-inference==0.1.1` 在 `--no-build-isolation` 下需要 nanobind/cmake/ninja，先带隔离预装它（及 fastokens / memfabric_hybrid / memcache_hybrid），或先 `pip install "cmake>=3.26" ninja`。**仅限 gcc≥9 的机器（如 `.190`）**；`.188` 的 gcc 8.3 编不了它，见坑 8。
+   > **2026-10-10 实测：`nanobind` 缺失时逐字报的是 `CMake Error at CMakeLists.txt:36 (find_package)`**（缺的正是 `nanobind` 的 CMake 配置包）→ 逐字补 **`pip install nanobind`** 即过。**别把它判成"C++20 不支持、得上 `--arctic`"**——本轮实测 `arctic-inference` 的拦路虎是 **`nanobind`，不是 C++20**，补上 nanobind 后**不需要 `--arctic`**（`--arctic` 只在系统 gcc 8.3 那条路上才需要，见坑 8 与 §3；两条不是一回事，别混）。
 6. AscendC 构建报 `No module named 'regex'` 或 CMake 找到 base conda 的 python：`export CONDA_PREFIX=<目标 env>`（或 `Python3_ROOT_DIR=<目标 env>`）后再装。**只做这一项还不够**——要按 §7.1 把共享 base 剔出 `PATH`、并显式 `rm -rf csrc/build`。
    > **2026-10-08 修正：原注「该现象是 `.190` 历史记录，2026-09-23 在 `.188` 实测未复现」是错的**（当时只是 shell 恰好不在 conda base）。真触发条件是**登录 shell 落在 conda base**，不是机器型号：`.188` 的共享 miniconda3 一进来就在 base（`CONDA_PREFIX=/mnt/share/x00886548/miniconda3`，python 3.14.7，**没有 `regex`**），而 CMake 的 `Modules/FindPython/Support.cmake` 会把 **`ENV CONDA_PREFIX`** 当 virtualenv 优先搜（原文 `PATHS ENV VIRTUAL_ENV ENV CONDA_PREFIX`），`find_package(Python3)` 又默认按 **VERSION 策略取最高版本** → **即使把 base 从 `PATH` 里剔干净，cmake 仍会选中 base 的 python3.14**，`csrc/cmake/scripts/util/ascendc_impl_build.py:21` 的 `import regex as re` 直接 `ModuleNotFoundError`。
    > 另：`csrc/build_aclnn.sh` 只删 `csrc/output` 与 `csrc/build_out`、**保留 `csrc/build`**（自己会打 `preserving csrc/build and cleaning output dirs`），而 `HI_PYTHON` 是 `CACHE STRING` → 选错的解释器会**跨轮存活**。所以清缓存要写 `rm -rf csrc/build csrc/output csrc/build_out build`（带了 aclnn 那套时 `csrc/build` 也要删），别只删 `build`。
@@ -396,6 +437,17 @@ unset VLLM_TARGET_DEVICE        # 若为 cpu，在本 shell 清掉后重跑 §5 
       pip install -r requirements/common.txt --only-binary=llguidance
       ```
       **正确机理**：该包在本机没有任何可用 wheel ⇒ **pip 的索引候选集为空** ⇒ 转而采用**已安装的 1.7.6**（它满足 `>=1.7.0,<1.8.0`）。实测把 30 分钟挂死变成秒级通过。
+      > **⚠️ 2026-10-10 修正：这条修法只在 `llguidance` 已经装好时成立，不许当通用修法用。** 它**没装**时，`--only-binary=llguidance` 反而把候选集**掏空**（本机该包没有任何可用 wheel）⇒ 报 `ERROR: Could not find a version that satisfies the requirement llguidance<1.8.0,>=1.7.0` / `No matching distribution found for llguidance<1.8.0,>=1.7.0`。**正确判据：先 `pip show llguidance` 看它在不在**——在 → 加该开关（利用已装版本）；**不在 → 走下面的离线补轮子**。
+      > **`llguidance` 缺失的正确修法 = 离线补自建轮子**（2026-10-10 实测通过）：直接把本机自建并缓存的 **`llguidance-1.7.6-cp39-abi3-linux_x86_64.whl`** 装上。**注意文件名是 `linux_x86_64`、没有 manylinux 标签**——这正是"本机自建"的标志（PyPI 上只有 `manylinux_2_31`，本机 glibc 2.28 装不了，机理见上）：
+      > ```bash
+      > pip install --no-index --find-links <wheelhouse> llguidance==1.7.6
+      > ```
+      > **⚠️ 症状会伪装成 CANN / SOC / 批不变性问题（本轮最大的误判陷阱）**：`llguidance` 缺失会让 `pip install -r requirements/common.txt` **整条 abort**，可真正爆出来的却是 C++ 侧这两行：
+      > ```
+      > ModuleNotFoundError: No module named 'regex'
+      > CMake Error at cmake/config.cmake:268 (message): Error: ops prepare build failed.
+      > ```
+      > ⇒ 看着像 CANN 版本 / `SOC_VERSION` / 批不变性脚本的问题，**真因只是 python 依赖没装齐**。而且这个 `No module named 'regex'` **有两个真因、必须先分开**：① cmake 的 `FindPython` 选中了共享 base conda 的 python3.14（坑 6）；② python 依赖没装齐（本条）。**判据是先跑 §4.3 的硬门控**，import 过不了就先修依赖，别去动 CANN。
     - **重要反例**：**仅仅"预先装好 llguidance"不足以绕过** —— 不加该开关时，pip 仍会为索引里的 sdist 候选准备元数据，从而**重新触发 Rust 构建**。
     - **判"是不是卡在这上面"的可复制证据（父 pip 进程 pid）**：`awk '{print $14+$15}' /proc/<pid>/stat` 隔 12s 取两次 **delta=0**；`grep State /proc/<pid>/status` = `S (sleeping)`；`cat /proc/<pid>/stack` = **`pipe_read`**；`ss -tnp | grep pid=<pip>` 出现 **`CLOSE-WAIT …:443`**；`ls -l /proc/<子进程>/cwd` 指向 **`pip-install-*/llguidance_*`**（元凶一眼看出）；进程树里能看到 **`rustup-init -y --no-modify-path --profile minimal --default-host x86_64-unknown-linux-gnu`**。
     - 旁证：本机自建并留下缓存的 wheel 文件名是 `llguidance-1.7.6-cp39-abi3-linux_x86_64.whl`（**`linux_x86_64`、无 manylinux 前缀**）——这正是"本机自建"的标志，也是它能被 pip 接受的原因（`linux_x86_64` 在兼容标签里，优先级低但可用）。

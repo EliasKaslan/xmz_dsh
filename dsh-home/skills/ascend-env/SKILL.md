@@ -1,6 +1,6 @@
 ---
 name: ascend-env
-description: 昇腾 NPU 服务器环境搭建入口总纲（a3=192.168.13.188 默认 / a3b=.190 备用）——**先并行再串行**的 4 lane 编排（CANN 包下载 ∥ conda 建环境 ∥ torch 栈 whl 预下载 ∥ 两仓 clone，barrier 后串行安装），含子代理写盘边界、机器怎么进、三层验收、从 Windows 驱动远端（base64 通道）的硬规则；具体步骤一律在子 skill。适用于"在昇腾机器上装环境 / 怎么并行搭环境省时间 / 下载和编译能不能同时跑 / 什么能并行什么必须串行 / 要不要派子代理去下载 / 不知道该先做哪一步 / 从零搭一套能跑 vllm 的环境 / 机器进不去或 ssh 假死"。不适用：目录与磁盘、模型在哪 → 用 `ascend-server-layout`；装 CANN → 用 `ascend-cann-env`；conda 与 python → 用 `ascend-conda-env`；跑推理 → 用 `ascend-vllm-serve`。
+description: 昇腾 NPU 服务器环境搭建入口总纲（a3=192.168.13.188 默认 / a3b=.190 备用）——**先并行再串行**的 4 lane 编排（CANN 包下载 ∥ conda 建环境 ∥ torch 栈 whl 预下载 ∥ 两仓 clone，barrier 后串行安装），含子代理写盘边界、机器怎么进、三层验收、从 Windows 驱动远端（scp 优先通道，内联引号会静默零命中）的硬规则；具体步骤一律在子 skill。适用于"在昇腾机器上装环境 / 怎么并行搭环境省时间 / 下载和编译能不能同时跑 / 什么能并行什么必须串行 / 要不要派子代理去下载 / 不知道该先做哪一步 / 从零搭一套能跑 vllm 的环境 / 机器进不去或 ssh 假死"。不适用：目录与磁盘、模型在哪 → 用 `ascend-server-layout`；装 CANN → 用 `ascend-cann-env`；conda 与 python → 用 `ascend-conda-env`；跑推理 → 用 `ascend-vllm-serve`。
 whenToUse: 昇腾环境从零搭建的编排入口——「哪些步骤能并行 / 先并行后串行的 lane 怎么划 / 子代理边界 / 该按什么顺序调哪个子 skill」看这里；具体步骤在子 skill。模型看不到本节。
 ---
 
@@ -171,7 +171,7 @@ python3 -c "from vllm.platforms import current_platform as p; print(type(p).__na
 
 ## 5. 从 Windows 驱动远端（所有子 skill 共用；违反会**静默失败**）
 
-- **内联 ssh 命令里禁用 `<`、`"`、`$()`**：PowerShell 会解析错误或吃掉内层引号（实测 `grep -E "a|b"` 的引号被剥掉，远端把 `|b` 当成了管道）。**2026-10-08 补机制（本轮复发 6 次，两次据此误判"进程已经死了"）**：本机是 Windows PowerShell 5.1，它会把**单引号内的双引号重新转义成 `\"`** 再交给原生程序，远端 bash 收到的是**字面引号** ⇒ `grep`/`pgrep`/`awk` 的模式**静默零匹配**（看着像"什么都没找到"，其实压根没匹配上），语法错误还会被 `2>$null` 一起吞掉。逐字症状：`bash: -c: line 0: syntax error near unexpected token '('`。**修法**：内联 ssh 只做**无引号的简单命令**（`cat <path>`、`bash /tmp/x.sh`）；凡需要模式匹配的一律 base64 推送 `.sh` 再执行（见下）。
+- **内联 ssh 命令里禁用 `<`、`"`、`$()`**：PowerShell 会解析错误或吃掉内层引号（实测 `grep -E "a|b"` 的引号被剥掉，远端把 `|b` 当成了管道）。**2026-10-08 补机制（本轮复发 6 次，两次据此误判"进程已经死了"）**：本机是 Windows PowerShell 5.1，它会把**单引号内的双引号重新转义成 `\"`** 再交给原生程序，远端 bash 收到的是**字面引号** ⇒ `grep`/`pgrep`/`awk` 的模式**静默零匹配**（看着像"什么都没找到"，其实压根没匹配上），语法错误还会被 `2>$null` 一起吞掉。逐字症状：`bash: -c: line 0: syntax error near unexpected token '('`。**修法**：内联 ssh 只做**无引号的简单命令**（`cat <path>`、`bash /tmp/x.sh`）；凡需要模式匹配或含变量者，一律**落脚本文件再推**（**首选 `scp`**，见下）。**2026-10-10 追加两条逐字实测**：`pgrep -af "pip|bisheng"` → 远端报 **`bash: bisheng: command not found`**；`python -c "...sys.argv[1]..."` → 远端报 **`bash: -c: line 0: syntax error near unexpected token 'sys.argv[1]'`**。**危险点在于"零命中"看起来就像"没找到"**——它与"确实不存在"在当次输出里**无法区分**（再被 `2>$null` 一吞更看不出）⇒ 别拿它下"没有这个进程 / 没有这条记录"的结论。同理，为避引号而省略引号会让模式**静默降级**：`grep -n installed successfully <log>` 报 **`grep: successfully: No such file or directory`**，实际只按 `installed` 匹配 ⇒ **多词模式必须写进 `.sh`**。
 - 复杂命令一律**本地写 .sh/.py → 用 base64 管道送过去**（2026-10-08 实测改，**取代原来的 `tail -c +4` 直推写法**）：
 
   ```powershell
@@ -184,6 +184,15 @@ python3 -c "from vllm.platforms import current_platform as p; print(type(p).__na
   ```
 
   - **判据只有一条：`md5sum` 与本地 md5 相同才算推送成功**。md5 不一致时**不要**接着跑——远端那份已经坏了。这条能同时兜住 GBK 改坏、CRLF、截断三种坏法。
+
+- ★ **通道优先级（2026-10-10 实测改）：首选 `scp`，base64 是退路。** `scp` 是**干净通道**——它不经 PowerShell 的引号重写、逐字节搬运：本轮把一段含 **2 个单引号 + 30 个双引号、1391 B** 的 `.sh` 用 `scp` 推送后，远端 `md5sum` 与本地**逐字相符**（byte-exact），**完全绕开下面那条"内联 ssh 引号被重写"的坑** ⇒ 能 `scp` 就别内联。
+
+  ```powershell
+  scp ".\x.sh" root@192.168.13.188:/tmp/x.sh
+  ssh -n root@192.168.13.188 "md5sum /tmp/x.sh"   # 必须等于本机 (Get-FileHash -Algorithm MD5 .\x.sh).Hash
+  ```
+
+  **判据与 base64 通道同一条：`md5sum` 逐字相符才继续**。`scp` 的唯一注意点仍是**本地文件自己带 BOM 会被一起搬过去**（见本节 BOM 那条）。
   - **`Get-Content -Raw` 会让"base64 通道"也坏**（2026-10-08 实测）：`Get-Content -Raw` → **GBK 解码** → `UTF8.GetBytes` 重编码，纯 ASCII 脚本侥幸无损，**含中文的脚本会被改坏**——实测 `scripts/strip_torch_pins.py`（中文 docstring）推过去后 `python` 报 `SyntaxError: invalid non-printable character U+E15E`（`閲屽舰濡` 这类 GBK 乱码），且**字节数从 7343 变成 7819**。改用 `[IO.File]::ReadAllBytes` 后 md5 与本地完全一致、`ast.parse` 通过。**凡是 `.py`（docstring/注释多是中文）一律用 ReadAllBytes**。
 
   - **base64 通道实测逐字无损、且不带 BOM**：含中文 + `%{http_code}` 的脚本往返后远端执行结果与本地一致（`确认 磁盘落点 并行` 原样保留、`%{size_download}` 正常展开）。
@@ -195,7 +204,7 @@ python3 -c "from vllm.platforms import current_platform as p; print(type(p).__na
     "PROBE" | ssh root@192.168.13.188 "od -An -c | head -1"   # 首字节出现 357 273 277（EF BB BF）= 有 BOM
     ```
   - **多行 + 中文的脚本经 PowerShell 管道直推正文会静默损坏**（2026-10-08 实测：同一份脚本直推后远端**丢行**，且 `确认` 变成私用区字符 `U+E1BF U+E17B`，bash 照跑不报错）→ **不要写 `(Get-Content -Raw …) | ssh … "… > /tmp/x.sh"`**，一律走上面的 base64。
-  - `scp` 同样可靠，**但注意本地文件的 BOM**：PS 5.1 `Set-Content -Encoding UTF8` 会写 BOM，scp 会把 BOM 一起带过去 → 远端报 `bash: /tmp/x.sh: line 1: ﻿#!/bin/bash: No such file or directory`。要么用 `[System.IO.File]::WriteAllText($p,$s,[Text.UTF8Encoding]::new($false))` 落本地文件，要么干脆 base64。
+  - `scp` **已升级为首选通道（见上）**，**但注意本地文件的 BOM**：PS 5.1 `Set-Content -Encoding UTF8` 会写 BOM，scp 会把 BOM 一起带过去 → 远端报 `bash: /tmp/x.sh: line 1: ﻿#!/bin/bash: No such file or directory`。要么用 `[System.IO.File]::WriteAllText($p,$s,[Text.UTF8Encoding]::new($false))` 落本地文件，要么干脆 base64。
 - **heredoc 只在「脚本先落盘、再执行」时可用**。用上面 base64 落盘 + `ssh -n ... "bash /tmp/x.sh"` 的模式下，脚本内的 heredoc（`python - <<'PY'`）**完全正常**，本套件多个 skill 的示例都这么写。
   **禁止的是把带 heredoc 的脚本直接经 ssh stdin 送进去**（`ssh root@192.168.13.188 "bash -s" < x.sh`、`cat x.sh | ssh root@192.168.13.188 bash`）：heredoc 会与脚本本身争抢 stdin，**永久挂起且不报错**。
 - **`ssh -n` 与「脚本走 stdin」互斥**：`-n` 只用于执行**远端已存在的文件**；任何 `$body | ssh … "… bash -s"` 的写法**绝不能加 `-n`**——stdin 被 `/dev/null` 占掉后脚本空跑且**不报错**，你只会看到输出为空（实测：`ssh -n … "od -An -c"` 读到的是空）。
@@ -209,6 +218,14 @@ python3 -c "from vllm.platforms import current_platform as p; print(type(p).__na
   - **修法**：`curl` 取文件**必须配重试循环**（`for i in 1 2 3 …` + `curl -fsS -o …`，`-f` 让 HTTP 错误码也非零），**并在消费之前做格式校验**；实测有效写法是取 40 位 commit SHA 时**校验 `^[0-9a-f]{40}$`**，不匹配即失败——**`exit 1`，绝不让下游拿空文件继续跑**。
   - **这条的价值在错误归因**：同一个「文件不存在」报错，可能是**网络失败**、也可能是**数据问题**，必须**在取数那一步就把二者分开**（`[ -s /tmp/x.txt ] || echo CURL_EMPTY >&2; exit 1`）。
 - **重启长任务前先确认旧实例真的死了**：`pgrep -af <name>` 期望输出 `(none)`。本轮出现过**两个同名长任务实例同时写同一个日志文件**，新实例启动时截断了旧文件，据此做出了错误判断（理由：脚本里某段 kill 落在输出被截断处、**实际未生效**）——旧实例还在跑，日志却已经被清空。
+- **`github.com:443` 在 `.188` 上实测不可达，但被封的只有它的 git 端点**（2026-10-10 实测）：`curl https://github.com` 超时（rc=28）、`git ls-remote https://github.com/...` rc=124、`gnutls` 报握手失败；而 **`api.github.com` / `raw.githubusercontent.com` / `codeload.github.com` 三个都可达**（REST API 与 raw 取文件照旧能用）⇒ 别据此判"整台机器连不上 GitHub"。**`git 2.20.1 + gnutls` 那串握手报错是"域名被封"的伪装——不要去动 `sslVerify`**（关掉校验也没用，是网络层不通）。
+  - **修法（git 取对象）**：走反代 clone `git clone https://ghfast.top/https://github.com/<owner>/<repo>.git`，然后 **`git remote set-url origin <规范 URL>` 把 origin 改回规范 URL**（否则后续 `git fetch` 会白等一轮超时）；再**留一个反代 remote 备用**（`git remote add ghproxy https://ghfast.top/https://github.com/<owner>/<repo>.git`），要拉更新时显式 `git fetch ghproxy`。
+- **用 `ssh … 2>&1 | Out-String` 取 base64 会把 stderr 噪声混进通道**（2026-10-09 实测）：本地 `[Convert]::FromBase64String(...)` 抛 `The input is not a valid Base-64 string as it contains a non-base 64 character, more than two padding characters, or an illegal character among the padding characters.`；且**本地文件不存在时 `-match ""` 会假报 MATCH**（空串恒匹配）。
+  - **修法三条**：① ssh 侧加 `2>$null`（只在这一处，取 base64 通道时；其它场合仍按上面那条"不要丢弃 stderr"）；② **先正则校验 base64**（`'^[A-Za-z0-9+/=\r\n]+$'`）再解码；③ **MD5 比对前先确认本地文件真的生成了**（`Test-Path` + 非零长度），否则比的是"两个都不存在"。
+- **PS 5.1 里 `ssh -n … "echo \$VAR"` 的 `\$` 不是转义**（2026-10-10 实测）：远端收到的是 `echo \`，**输出空行**，并报 `bash: -c: line 0: unexpected EOF while looking for matching '"'`。
+  - **修法**：**传给 ssh 的参数一律用单引号**（`ssh -n root@192.168.13.188 'echo $VAR'`），别指望 `\$`。
+  - **判断纪律：「输出空」不等于「变量为空」**——先怀疑引号/转义/`2>$null` 吃掉了报错，再怀疑远端真的没设这个变量（本轮据此误判过一次）。
+- **远端 / 共享文件可能正被并发写手改**（2026-10-10 实测：目标文件在 **25 分钟内被保存 4 次**，**23500 → 24842 B**）：要审计、复跑或再推送别人**可能还在编辑**的文件时，**先等它稳定 → 取快照 → 记快照 md5 → 只审计并只运行快照**，并用 md5 闸门**拦下中间态推送**；**不要覆盖或删除与自己版本不同的并发产物**，改用**新目录**锁存（本轮用 `/tmp/fv2_lock/`，md5 闸门拦下 2 次中间态推送）。完整配方见 `orchestrating-subagents` §9.17（单一归属，本节只留指针）。
 
 ## 6. 不要做什么
 
