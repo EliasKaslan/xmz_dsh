@@ -80,3 +80,16 @@
           MS365_MCP_TOKEN_CACHE_PATH: <redacted>
           MS365_MCP_SELECTED_ACCOUNT_PATH: 'C:\Users\admin\.dsh\.secrets\ms365\.selected-account.json'
           MS365_MCP_MESSAGE_SIGNOFF_PREFIX: '🤖 '
+
+    - id: mcp-qqmail
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: qqmail
+        transport: stdio
+        command: 'C:\Program Files\nodejs\node.exe'
+        args:
+          - 'C:\Users\admin\.dsh\mcp\qqmail\node_modules\@zhengjunyao\dsh-qqmail\lib\mcp-server.js'
+          - '--allow-write'
+        env:
+          DSH_QQMAIL_CONFIG: 'C:\Users\admin\.dsh\.secrets\qqmail\config.json'
+          DSH_QQMAIL_DATA_DIR: 'C:\Users\admin\.dsh\.secrets\qqmail\data'

@@ -1,6 +1,6 @@
 # EXCLUDED - items deliberately kept out of the snapshot
 
-- generated (utc): 2026-10-13T01:30:02Z
+- generated (utc): 2026-10-14T01:30:03Z
 - generator: sync-dsh-repos.ps1
 - relative paths and byte sizes only. No file content is recorded in this file.
 - counts are a point-in-time measurement; the sessions trees grow while DSH runs.
@@ -14,12 +14,13 @@
 ## selected-account metadata); the directory is pruned as a unit.
 ## node_modules is the npm dependency tree (hundreds of MB, reproducible).
 
-DIR | .secrets | files=4 | bytes=9251
+DIR | .secrets | files=5 | bytes=9710
 DIR | launcher\runtime\node_modules | files=26621 | bytes=475341646
+DIR | mcp\qqmail\node_modules | files=5633 | bytes=34455068
 DIR | profiles\headless\node_modules | files=0 | bytes=0
 DIR | profiles\web\node_modules | files=4 | bytes=2182
-DIR | sessions | files=758 | bytes=290790442
-DIR | storages | files=747 | bytes=13739025
+DIR | sessions | files=781 | bytes=295823087
+DIR | storages | files=770 | bytes=14137944
 
 ## File-level exclusions (name patterns, matched at any depth)
 ## rule: robocopy /XF *credentials* *.key *.pem *.token .credentials.yaml *.zstd

@@ -1,6 +1,6 @@
 ---
 name: dsh-repo-sync
-description: DSH 配置到私仓的确定性同步机制——脚本 sync-dsh-repos.ps1 把 `C:\Users\admin\.dsh` 与编排 preset 用 robocopy 快照进 `D:\repos\deepseek-harness`，排除 sessions/node_modules/.secrets/storages/凭据/zstd，根级 cordis.patch.yml 里的明文 PAT 会被值脱敏成 redacted，运行时不打印令牌，退出码 0/3/4/5/6/7/8，状态与告警落 `sync\state.json`、`sync\ALERT.md`。适用于"手动同步我的私仓 / 现在同步一次 / 同步坏了怎么办 / ALERT.md 出现了 / 昨天同步没成功 / 私仓内容少了或不对 / 计划任务 DSH-Repo-Sync 报错 / 想改同步的排除项"。不适用：向 GitHub 上游仓提 PR → 用 `github-pr-flow`；向 GitCode 社区仓提 PR → 用 `gitcode-pr-flow`。
+description: DSH 配置到私仓的确定性同步机制——脚本 sync-dsh-repos.ps1 把 `C:\Users\admin\.dsh` 与编排 preset 用 robocopy 快照进 `D:\repos\deepseek-harness`，根级 cordis.patch.yml 里的明文 PAT 会被值脱敏成 redacted，运行时不打印令牌，退出码 0/3/4/5/6/7/8，状态与告警落 `sync\state.json`、`sync\ALERT.md`。适用于"私仓天天收到 workflow 失败邮件 / 手动同步我的私仓 / 现在同步一次 / 同步坏了怎么办 / ALERT.md 出现了 / 昨天同步没成功 / 私仓内容少了或不对 / 计划任务 DSH-Repo-Sync 报错 / 想改同步的排除项"。不适用：向 GitHub 上游仓提 PR → 用 `github-pr-flow`；向 GitCode 社区仓提 PR → 用 `gitcode-pr-flow`。
 whenToUse: 要手动跑一次 ~/.dsh 到私仓的同步、排查同步失败（ALERT/退出码/日志）、或改同步排除项与计划任务时使用。模型看不到本节，触发只靠 description。
 ---
 
@@ -204,6 +204,44 @@ GitCode 写回 `D:\key\gitcode_访问令牌_xmz_agent用.txt`。两个文件 202
 **三个会话记录位置**：`~/.dsh\sessions\`、`~/.dsh\storages\session_projcache\sessions\`、
 `~/.dsh\storages\session_projcache.json`——前两个被 `/XD sessions` / `/XD storages` 整块挡掉。
 
+**每天收到 GitHub「workflow run failed」邮件（镜像仓继承了上游 CI，2026-10-13 实测）**——把**官方源码**镜像进私仓，会连带把上游的 `.github/workflows/`（本例 **23 个** workflow）与 `.github/dependabot.yml` 一起搬进来，而私仓的 Actions **默认启用** ⇒ **每次推送都会触发一批必然失败的 run**；GitHub 随后把「workflow run failed」通知发到**触发者账号的 primary 邮箱**（本例实测 `GET /user/emails` → `****@qq.com`，`primary=True, verified=True`），同时在 private 仓**消耗 Actions 分钟数**。本例实测：每天 09:30（UTC+8）推送对齐一批 **4 条 failure**（Sandbox / Release (dsh) / Release (vendor) / E2E (real DeepSeek API)），另有上游 `schedule` 触发的 E2E 每天也 failure。
+
+**取证链（顺序固定，别跳步；`{o}/{r}` = owner/repo）**：
+
+1. `GET /repos/{o}/{r}/actions/permissions` —— 看 `enabled` / `allowed_actions`（这一步就能解释"为什么会有 run"）。
+2. `GET /repos/{o}/{r}/actions/runs?per_page=N` —— 把 `created_at` 与**推送时刻**对齐；看 `event=push` / `schedule` / `dynamic`。
+3. `GET /repos/{o}/{r}/actions/runs/{run_id}/jobs` —— **关键判据：`steps_count=0` + 启动 2 秒即 failure + `runner_name` 为空 = 这个 job 从未启动**。
+4. **失败原文只在 check-run annotation 里**：`GET /repos/{o}/{r}/check-runs/{job_id}/annotations`。
+
+三个坑（都实测，别浪费一轮）：
+
+- **坑 1**：`GET /repos/{o}/{r}/actions/jobs/{job_id}/logs` 对**未启动**的 job 返回 **404** ⇒ **别去拉 job 日志判因**（拉不到不代表没有原因，原因在 annotation 里）。
+- **坑 2**：`GET /users/{u}/settings/billing/actions` 已 **410 迁移**（原文 `This endpoint has been moved.`）⇒ 计费不能靠这个端点取证，只能看 annotation 原文。本例 annotation **逐字**：`The job was not started because recent account payments have failed or your spending limit needs to be increased. Please check the 'Billing & plans' section in your settings`。
+- **坑 3（推论纪律）**：仅凭镜像里出现 `runs-on: [self-hosted, ...]` 或第三方 runner（如 `blacksmith-8vcpu-ubuntu-2404`）就断言"失败是因为缺 runner"是**错的**——本例真正失败的那批是**被账号计费拦在启动前**（`cancelled` / `queued` 的 `CI master` 才与自建 runner 标签有关）。**先看 steps/annotation，再谈 runner。**
+
+**修法（改设置，不动镜像内容）**：`PUT /repos/{o}/{r}/actions/permissions`，body `{"enabled": false}` → **204**，回读 `enabled=false`。镜像内容**逐字节不变**——这是它相对"把 workflows 从镜像里剔掉"方案的最大优点（后者会与上游 merge 反复冲突）。
+
+- **顺序：先关 Actions、再删 dependabot 分支**——dependabot 的版本更新本身就是 Actions run（`event=dynamic`）⇒ **不先关它会重建分支**。
+- 删分支：`DELETE /repos/{o}/{r}/git/refs/heads/<branch>`（**分支名含 `/`**，如 `dependabot/github_actions/actions/cache-6`）；删分支会**自动关闭**引用它的 PR。
+
+**边界**：计费问题本身是**账号级**的、与本仓内容无关——关掉本仓 Actions 只止住**这一仓**的噪声；其它仓若依赖 Actions，须自行处理 Billing & plans。
+
+**GitCode 侧无此问题**：实测 `GET /api/v5/repos/{o}/{r}` 的 **37 个字段无** pipeline/ci/webhook 类字段、`/pipelines` **404 未暴露**、`/hooks` **count=0** ⇒ GitCode 不会产生失败邮件。**别把 GitCode 的 events 当数组直接解**——它是 `{"events":[…]}` 包装对象。
+
+**彻底静音（2026-10-13 补充实测）**：
+
+- **账号级 Actions 关不掉（REST 无端点）**：`PUT` 与 `GET /users/{u}/actions/permissions` 实测**均 404**，错误体逐字 `{"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}`——注意 `documentation_url` 是**通用 `/rest`**（= 路由不存在），**不是**权限不足（权限不足是 **403**）。文档里的 Actions permissions 端点只有 **repo / org / enterprise** 三级 ⇒ **账号级只能在 UI 关**：`https://github.com/settings/actions` → **Actions permissions** → 选 **Disable actions** → Save（该页四个选项：Allow all / **Disable actions** / Allow `<用户名>` / Allow `<用户名>`, and select non-`<用户名>`）。
+- **边界补充（"只用 GitHub 当云仓库、不想付费"这个立场下）**：**仓库级关 Actions 已足够**止住失败邮件与分钟数消耗；**账号级**开关只是防止**以后新建的仓**再误触。关掉这些**不影响**推送 / 拉取 / 存储 / 历史 / 私有可见性。
+
+**Dependabot 的两个独立开关（与 Actions 无关、不花钱，但也是通知邮件来源，容易被忽略）**：
+
+- **告警**：`GET /repos/{o}/{r}/vulnerability-alerts` → **404 = 已关闭**（原文 `{"message":"Vulnerability alerts are disabled.",…}`）、**200/204 = 已启用**；关闭用 `DELETE /repos/{o}/{r}/vulnerability-alerts` → **204**。
+- **自动安全修复**：`GET /repos/{o}/{r}/automated-security-fixes` → 原文 `{"enabled":false,"paused":false}`；**在告警已关闭时**调 `DELETE /repos/{o}/{r}/automated-security-fixes` 会返回 **422**，原文 `{"message":"Vulnerability alerts must be enabled to configure automated security fixes.","documentation_url":"https://docs.github.com/rest/repos/repos#disable-dependabot-security-updates","status":"422"}` —— **这是幂等前置条件不满足（告警没开就没得关），不是失败**，别当故障去排查。
+
+**归属澄清（关键，别混）**：dependabot **版本更新**是 **Actions run**（`event=dynamic`，由仓里 `.github/dependabot.yml` 驱动）⇒ **关掉 Actions 即随之停止**；dependabot **安全告警 / 自动修复**走 GitHub 自己的服务、**与 Actions 无关** ⇒ 要**单独关**。
+
+**反向印证**：该仓的 Dependabot 告警与自动修复**本就处于关闭态**（上面原文）⇒ 之前那些失败邮件**只可能来自 Actions 一个来源**。
+
 ## 5. 边界（不要做什么）
 
 - **不要绕过脚本手动 force push**（`git push --force` / `-f`）。脚本的推送形态是 `HEAD:master`，被拒时先
@@ -219,6 +257,8 @@ GitCode 写回 `D:\key\gitcode_访问令牌_xmz_agent用.txt`。两个文件 202
 - **不要删掉 `cordis.patch.redacted.yml` 的生成逻辑**——根级 `cordis.patch.yml` 里是明文 PAT，
   少了这一步它就会被 `git add -A` 收进提交并推到两个私仓。
 - **不要指望脚本注册计划任务**：它只跑同步；计划任务 `DSH-Repo-Sync` 由人注册（命令见 §3）。
+- **不要把「私仓天天收到 workflow 失败邮件」当成同步坏了**：那是镜像携带的上游 CI 在跑，与脚本退出码无关 ⇒ 处置见 §4 最后一条。
+- **不要为了让 CI 不报错而把 `.github/workflows` 从镜像里剔掉**：那是与上游 merge 的长期冲突源；正解是关 Actions（`PUT .../actions/permissions` `{"enabled": false}`，见 §4）。
 - **不要在 DryRun 里找推送结果**：DryRun 不起 git、不推送，`remotes` 全 `fail` 是设计如此，不是失败。
 
 ## 6. `sync\remotes.json` 逐字 schema
