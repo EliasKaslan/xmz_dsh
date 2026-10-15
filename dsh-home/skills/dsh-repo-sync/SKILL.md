@@ -1,6 +1,6 @@
 ---
 name: dsh-repo-sync
-description: DSH 配置到私仓的确定性同步机制——脚本 sync-dsh-repos.ps1 把 `C:\Users\admin\.dsh` 与编排 preset 用 robocopy 快照进 `D:\repos\deepseek-harness`，根级 cordis.patch.yml 里的明文 PAT 会被值脱敏成 redacted，运行时不打印令牌，退出码 0/3/4/5/6/7/8，状态与告警落 `sync\state.json`、`sync\ALERT.md`。适用于"私仓天天收到 workflow 失败邮件 / 手动同步我的私仓 / 现在同步一次 / 同步坏了怎么办 / ALERT.md 出现了 / 昨天同步没成功 / 私仓内容少了或不对 / 计划任务 DSH-Repo-Sync 报错 / 想改同步的排除项"。不适用：向 GitHub 上游仓提 PR → 用 `github-pr-flow`；向 GitCode 社区仓提 PR → 用 `gitcode-pr-flow`。
+description: DSH 配置到私仓的确定性同步机制——脚本 sync-dsh-repos.ps1 把 `C:\Users\admin\.dsh` 与编排 preset 用 robocopy 快照进 `D:\repos\deepseek-harness`，根级 cordis.patch.yml 里的明文 PAT 会被值脱敏成 redacted，运行时不打印令牌，退出码 0/3/4/5/6/7/8，状态与告警落 `sync\state.json`、`sync\ALERT.md`。适用于"私仓天天收到 workflow 失败邮件 / 手动同步我的私仓 / 现在同步一次 / 同步坏了怎么办 / ALERT.md 出现了 / 昨天同步没成功 / 私仓内容少了或不对 / 计划任务 DSH-Repo-Sync 报错 / 想改同步的排除项 / 把私仓公开 / 把同步仓公开"。不适用：向 GitHub 上游仓提 PR → 用 `github-pr-flow`；向 GitCode 社区仓提 PR → 用 `gitcode-pr-flow`。
 whenToUse: 要手动跑一次 ~/.dsh 到私仓的同步、排查同步失败（ALERT/退出码/日志）、或改同步排除项与计划任务时使用。模型看不到本节，触发只靠 description。
 ---
 
@@ -236,11 +236,33 @@ GitCode 写回 `D:\key\gitcode_访问令牌_xmz_agent用.txt`。两个文件 202
 **Dependabot 的两个独立开关（与 Actions 无关、不花钱，但也是通知邮件来源，容易被忽略）**：
 
 - **告警**：`GET /repos/{o}/{r}/vulnerability-alerts` → **404 = 已关闭**（原文 `{"message":"Vulnerability alerts are disabled.",…}`）、**200/204 = 已启用**；关闭用 `DELETE /repos/{o}/{r}/vulnerability-alerts` → **204**。
+- **转 public 后安全告警会不会被自动打开：本例实测"没有"（2026-10-14）**——GitHub 对 public 仓**默认**开启 Dependabot 安全告警，但**该默认值不覆盖一次显式的关闭**：本例私有时主动关掉（404），**转 public 后实测仍为 404**（`GET /repos/EliasKaslan/xmz_dsh/vulnerability-alerts`），`automated-security-fixes` 亦仍为 `{"enabled":false,"paused":false}` ⇒ **别把"转公开 ⇒ 告警被自动打开"写成结论**；转公开后**重读一次**即可判，判据 = `GET /repos/{o}/{r}/vulnerability-alerts` → **200/204 = 已启用、404 = 已关闭**，`GET /repos/{o}/{r}/automated-security-fixes` → `{enabled,paused}`（告警关闭时对它 `DELETE` 返回 **422** 幂等前置条件错误，不是失败）。**同批实测里确实发生的是另一件：转公开后依赖图会重跑**——本例转公开后 dependabot 立刻又动作（那道反证见下一条 `归属澄清`）。
 - **自动安全修复**：`GET /repos/{o}/{r}/automated-security-fixes` → 原文 `{"enabled":false,"paused":false}`；**在告警已关闭时**调 `DELETE /repos/{o}/{r}/automated-security-fixes` 会返回 **422**，原文 `{"message":"Vulnerability alerts must be enabled to configure automated security fixes.","documentation_url":"https://docs.github.com/rest/repos/repos#disable-dependabot-security-updates","status":"422"}` —— **这是幂等前置条件不满足（告警没开就没得关），不是失败**，别当故障去排查。
 
-**归属澄清（关键，别混）**：dependabot **版本更新**是 **Actions run**（`event=dynamic`，由仓里 `.github/dependabot.yml` 驱动）⇒ **关掉 Actions 即随之停止**；dependabot **安全告警 / 自动修复**走 GitHub 自己的服务、**与 Actions 无关** ⇒ 要**单独关**。
+**归属澄清（关键，别混）**：dependabot **版本更新**是 **Actions run**（`event=dynamic`，由仓里 `.github/dependabot.yml` 驱动）——但**"关掉 Actions 即随之停止"已被 2026-10-14 实测证伪**：该仓 `actions/permissions` 仍是 `{"enabled":false,"sha_pinning_required":false}`，`2026-10-14T03:06:08Z` 照样起了 3 条 `event=dynamic` 的 dependabot run（`github_actions in /. - Update #1626029849 | completed | success`、`uv in /python/sdk - Update #1626029825 | completed | failure`、`npm_and_yarn in /. - Update #1626029794 | completed | failure`），紧接着 `2026-10-14T03:08:38Z–03:13:35Z` 新建 **5 个 PR / 5 条分支**（#10–#14，user=`dependabot[bot]`，形如 `build(deps-dev): bump papaparse from 5.5.3 to 5.7.0`）⇒ **依赖更新不受 `actions/permissions.enabled=false` 约束**；想真正停掉只能**去掉 / 中和 `.github/dependabot.yml`**（代价：与上游内容偏离，每次上游更新该文件都要处理冲突），或**接受它继续开 PR**（PR 通知是**另一种**邮件，与 Actions 邮件来源不同）。dependabot **安全告警 / 自动修复**走 GitHub 自己的服务、**与 Actions 无关** ⇒ 要**单独关**。
 
-**反向印证**：该仓的 Dependabot 告警与自动修复**本就处于关闭态**（上面原文）⇒ 之前那些失败邮件**只可能来自 Actions 一个来源**。
+**反向印证（时刻值，只对 2026-10-13 的私有态成立）**：该仓的 Dependabot 告警与自动修复**当时**本就处于关闭态（上面原文）⇒ 那些失败邮件**只可能来自 Actions 一个来源**。**转公开后这一前提要重测**——本例 2026-10-14 实测告警仍 404（前提未被掀掉），见下一条。
+
+**公开镜像仓：把私仓翻成公开之前必须先扫历史（2026-10-14 实测）**——公开的是**同一个仓库、同一条生命周期**（推送对齐 → 邮件静音 → 可见性），所以处置写在本节，不另立 skill。
+
+- **扫的是历史，不是工作区**：可见性由**历史**决定，工作区干净 ≠ 历史干净。配方 = `git rev-list --objects --all` 取全部对象 → `git cat-file --batch --buffer` **流式**喂 Python 做**字节精确**扫描（本例 **255,989 blobs / 7.0 GB / 37 s**）。
+- **扫描器必须带自测**：先**故意植入一个假 token**，用同一套代码证明它命中（本例自测 `HITS=1`）——**没有自测的"0 命中"不算证据**。
+- **范围**：上游历史本就公开，重点是自己新增的路径（本例 `git rev-list upstream/master..master` = **10 commits / 84 files**，路径只有 `dsh-home/`、`dsh-presets/`、`sync/`、`.gitignore`）。但**全量 blob 扫描更快也更兜底，优先用它**。
+- **红旗判据**：根级 `cordis.patch.yml`（**脱敏前的明文令牌版本**）在**历史中出现次数必须 = 0** 才算过关（本例实测 0）。工作区里它已被换成 `cordis.patch.redacted.yml`，历史里那条才是真泄漏面。
+- **翻开关**：GitHub `PATCH /repos/{o}/{r}`，body `{"private": false}` → **200**，回读 `private=false, visibility=public`；GitCode `PATCH https://api.gitcode.com/api/v5/repos/{o}/{r}`（header `private-token`）+ 同一个 body `{"private": false}` → 本例**首次即 200**；**GitCode 的回读判据用 `public` / `private` 字段**——它的响应里 `visibility` 是空的，**别拿它当判据**。
+- **验收必须真匿名**：URL 里**不带 token** + `-c credential.helper=` + `GIT_TERMINAL_PROMPT=0` ⇒ `ls-remote` exit=0 **并且** `clone --depth 1` 真拉下来（本例 GitHub 与 GitCode 各 **15,071 文件**，再抽查已知文件存在）；另加一个**完全不带 `Authorization` 头**的 REST `GET /repos/{o}/{r}` 交叉验证。
+- **许可前置**：先确认上游本身公开且许可允许再分发（本例上游 `deepseek-ai/deepseek-harness` 匿名可读、**MIT**、`LICENSE` 首行 `MIT License`）。**上游若是专有代码，公开镜像 = 再分发他人代码。**
+- **公开前先想清会露出什么（本例实测会露出的，作检查清单）**：令牌文件的**路径**（`sync/remotes.json`、以及 skill 正文里写的 `D:\key\...` 之类）、旧的 `.bak` 备份里残留的**个人邮箱**、`.anonymous-user-id` 的**遥测 UUID**、网关 `baseURL`。**公开后这些进了历史并被索引缓存，翻回私有 ≠ 收回。**
+- **转公开会重新引入噪声面**：依赖图会重跑（本例转公开后 dependabot 立刻又动作）；安全告警**是否**被自动开启已有实测答案（本例：**没有**，转公开后仍 404）⇒ 完整事实与判据见本节 Dependabot 段，别在这里重述。
+- **四个坑（都实测）**：① `git log -p <tip>` 会展开**整条祖先链**（本例 21k commits，落盘 1.4 GB 还在涨）⇒ 改 blob 级扫描；② `git log -p <多个 sha 拼成单串>` 报 `fatal: failed to stat '<长串>': Filename too long` ⇒ 传数组或改 blob 级；③ `findstr` 有**行长上限会漏** ⇒ 用 Python 字节流；④ 落盘的 `.diff` 被 pwsh 句柄占用会让 `Remove-Item` 失败（`being used by another process`）⇒ 用完即删或全程流式。
+
+**`.github/dependabot.yml` 已从镜像移除，脚本带"仅此一路径"的自愈补丁（2026-10-14 实测 + 真跑模拟）**——这是本 skill 里**唯一**一处**故意与上游不一致**的地方，**不是**"可以随手改上游文件"的通则。
+
+- **为什么删**：Actions 已关（`actions/permissions` = `{"enabled":false,"sha_pinning_required":false}`），dependabot 版本更新**照样**跑（`2026-10-14T03:06:08Z` 起 3 条 `event=dynamic` run，紧接 **5 个 PR / 5 条分支**，原文见本节 Dependabot 段）⇒ 去掉 `.github/dependabot.yml` 是**唯一**能停掉它的办法，代价是与上游偏离该文件。
+- **现状证据**：镜像仓 `master` 已删除该文件（commit `fc26a0f73f80599e2de39844a34fdce3e0c5997b`，GitHub 与 GitCode 两端 `master` 均为此值），**匿名**读取该路径 **404**。
+- **自愈补丁的边界（窄闸门，唯一例外）**：`sync-dsh-repos.ps1` 在 `git merge --no-edit upstream/master` 失败后，只问一句"**唯一的 unmerged 路径**是不是 `.github/dependabot.yml`"（`git diff --name-only --diff-filter=U`）；**是** ⇒ `git rm --force` 该文件解掉冲突（保住删除）并**交回原有的 `git add -A` + commit** 收尾（最终**恰好一个合并提交**、工作区干净）；**否则**（别的文件冲突、或"该文件 + 别的文件同时冲突"、或 merge 因非冲突原因失败）⇒ **逐字保持**原来的 `merge --abort` + `exit 4`。
+- **实测判据（一次性克隆里真跑打过补丁的逻辑）**：`.github/dependabot.yml` 单点 modify/delete 冲突 ⇒ `exit 0`、日志 `SELF-HEAL:`、`log --oneline -1` 是那条 sync 合并提交（2 个 parent）、`Test-Path` = `False`、`status --porcelain` 空；README 冲突 ⇒ `exit 4`；`.github/dependabot.yml` + README 同时冲突 ⇒ 仍 `exit 4`。
+- **别推广**：与上游**逐字节一致仍是默认**。下次真要删/改某个上游文件，必须**同时在脚本里加一个同样窄的闸门**、并把"单点冲突自动解、多点冲突照旧中断"写成可复现判据，别"顺手改文件"了事。
 
 ## 5. 边界（不要做什么）
 

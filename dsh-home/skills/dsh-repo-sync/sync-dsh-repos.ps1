@@ -723,10 +723,32 @@ function Invoke-Main {
             if ($behind -gt 0) {
                 $m = Invoke-Git @('-C', $Mirror, 'merge', '--no-edit', 'upstream/master')
                 if ($m.Code -ne 0) {
-                    Write-LogLine 'ERROR: upstream merge failed; aborting merge'
-                    Write-LogLine $m.Text
-                    $null = Invoke-Git @('-C', $Mirror, 'merge', '--abort')
-                    Stop-Run 4 'upstream merge conflict while merging upstream/master'
+                    # Narrow self-heal gate, exactly one path: .github/dependabot.yml
+                    # was deleted on purpose in the mirror (upstream keeps touching
+                    # a Dependabot workflow we deliberately do not carry). When
+                    # upstream later edits that file, git stops with
+                    # "CONFLICT (modify/delete)" and the whole sync would jam.
+                    # If that path is the ONLY unmerged path, keep our deletion
+                    # and let the normal stage + commit below finish the merge.
+                    # Any other conflict (or any other path) keeps the original
+                    # abort + exit 4 behaviour, byte for byte.
+                    $healed = $false
+                    $u = Invoke-Git @('-C', $Mirror, 'diff', '--name-only', '--diff-filter=U')
+                    if ($u.Code -eq 0) {
+                        $un = @($u.Text -split "`r?`n" | Where-Object { $_.Trim() -ne '' })
+                        if ($un.Count -eq 1 -and $un[0].Trim() -eq '.github/dependabot.yml') {
+                            $rm = Invoke-Git @('-C', $Mirror, 'rm', '--force', '--quiet', '--', '.github/dependabot.yml')
+                            if ($rm.Code -eq 0) { $healed = $true }
+                        }
+                    }
+                    if ($healed) {
+                        Write-LogLine 'SELF-HEAL: .github/dependabot.yml modify/delete conflict resolved (deletion kept); merge continues'
+                    } else {
+                        Write-LogLine 'ERROR: upstream merge failed; aborting merge'
+                        Write-LogLine $m.Text
+                        $null = Invoke-Git @('-C', $Mirror, 'merge', '--abort')
+                        Stop-Run 4 'upstream merge conflict while merging upstream/master'
+                    }
                 }
                 $upMoved = $true
             }

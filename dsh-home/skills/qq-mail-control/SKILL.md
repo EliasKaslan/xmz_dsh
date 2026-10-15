@@ -1,7 +1,7 @@
 ---
 name: qq-mail-control
-description: QQ 邮箱接管（stdio MCP `qqmail`，IMAP/SMTP）——12 个工具的最小参数配方、modified UTF-7 文件夹名、FETCH 只读铁律、中文搜索只覆盖本地窗口、发信必须带【AI 代发】前缀、无草稿能力、凭据位置与 `--read-only` 静默陷阱。适用于"发一封 QQ 邮件 / 查一下 QQ 邮箱收件箱 / 搜一下 QQ 邮箱里的邮件 / QQ 邮箱 MCP 怎么用 / 帮我读某封 QQ 邮件 / QQ 邮箱文件夹名乱码 / QQ 邮箱只能读不能发"。不适用：Outlook / MSA 邮箱 → 用 `outlook-mailbox-control`；改 patch 与 MCP 接入层生效时机 → 用 `dsh-agent-customization`；本机 PowerShell 的坑 → 用 `pwsh-on-windows`。
-whenToUse: 用 DSH 的 `mcp__qqmail__*` 工具接管 QQ 邮箱（列/搜/读/附件/发/回复/标记/移动/删除）或排查其授权码、只读开关、文件夹名编码问题时使用。凭据是明文 JSON。模型看不到本节。
+description: QQ 邮箱接管（stdio MCP `qqmail`，IMAP/SMTP）——12 个工具的最小参数配方、文件夹名编码（`qqmail_folders` 回显中文原文、UTF-8 原文直传可用，传 `&UXZO1mWHTvZZOQ-` 这类 modified UTF-7 串报 `Error： Command failed`）、FETCH 只读铁律、中文搜索只覆盖本地窗口、发信必须带【AI 代发】前缀、无草稿能力、凭据位置与 `--read-only` 静默陷阱。适用于"发一封 QQ 邮件 / 查一下 QQ 邮箱收件箱 / 搜一下 QQ 邮箱里的邮件 / QQ 邮箱 MCP 怎么用 / 帮我读某封 QQ 邮件 / QQ 邮箱文件夹名乱码 / QQ 邮箱只能读不能发"。不适用：Outlook / MSA 邮箱 → 用 `outlook-mailbox-control`；改 patch 与 MCP 接入层生效时机 → 用 `dsh-agent-customization`；本机 PowerShell 的坑 → 用 `pwsh-on-windows`。
+whenToUse: 用 DSH 的 `mcp__qqmail__*` 工具接管 QQ 邮箱（列/搜/读/附件/发/回复/标记/移动/删除）或排查其授权码、只读开关、文件夹名编码时使用。凭据是明文 JSON。模型看不到本节。
 ---
 
 # QQ 邮箱接管（stdio MCP `qqmail`）
@@ -10,7 +10,7 @@ whenToUse: 用 DSH 的 `mcp__qqmail__*` 工具接管 QQ 邮箱（列/搜/读/附
 
 **加载本 skill 当：**
 - 用户说"发一封 QQ 邮件 / 查一下 QQ 邮箱收件箱 / 搜一下 QQ 邮箱里的邮件 / QQ 邮箱 MCP 怎么用 / 帮我读某封 QQ 邮件 / QQ 邮箱能不能存草稿"。
-- 命令输出里出现这些可观测信号：`mcp__qqmail__`、`Unsafe Login`、`qqmail_status` 回显的 `wwgv…` 形态授权码前缀、文件夹名是 `&UXZO1mWHTvZZOQ-` 这类 base64 样的串、`mode:"local"`、`readOnly`、`DSH_QQMAIL_CONFIG`。
+- 命令输出里出现这些可观测信号：`mcp__qqmail__`、`Unsafe Login`、`qqmail_status` 回显的 `wwgv…` 形态授权码前缀、传中文夹名或 modified UTF-7 串时报 `Error: Command failed` / 找不到文件夹、`mode:"local"`、`readOnly`、`DSH_QQMAIL_CONFIG`。
 - 要把这个 MCP server 新挂进 `cordis.patch.yml`（**接入层写法与生效时机在 `dsh-agent-customization`，本 skill 只给已落盘那一行的形状**）。
 
 **不要用本 skill（转交）：**
@@ -27,22 +27,23 @@ whenToUse: 用 DSH 的 `mcp__qqmail__*` 工具接管 QQ 邮箱（列/搜/读/附
 
 **12 个工具（逐字名，别改大小写 / 别缩写）**：
 
-| 组 | 工具 | 最小参数 |
+| 组 | 工具 | 真实 schema 参数（**以工具自带 schema 为准**） |
 | --- | --- | --- |
 | 状态 | `qqmail_status` | `{}` |
 | 配置 | `qqmail_config` | `{}` |
 | 文件夹 | `qqmail_folders` | `{}` |
-| 列表 | `qqmail_list` | `{"folder":"INBOX","limit":10}` |
-| 搜索 | `qqmail_search` | `{"query":"关键词"}`（`folder` / `limit` 可选） |
-| 读信 | `qqmail_read` | `{"uid":<uid>}`（`folder` 可选） |
-| 附件 | `qqmail_attachment` | `{"uid":<uid>,"index":0}` |
+| 列表 | `qqmail_list` | `{mailbox, limit, order, unseen, flagged, preview}`；最小可用 `{"mailbox":"INBOX","limit":10}`；**只读模式**另有 `{"mailbox":"INBOX","unseen":true}` |
+| 搜索 | `qqmail_search` | `{mailbox, since, before, from, to, subject, body, text, order, limit, preview, unseen, flagged, larger, smaller}`；**没有 `query` 这个参数** |
+| 读信 | `qqmail_read` | `{uid 或 uids(≤10 批量), mailbox, html, markSeen, maxBodyChars}`；最小可用 `{"uid":<uid>}` |
+| 附件 | `qqmail_attachment` | `{"uid":<uid>,"index":0}`（参数**本轮未复核**） |
 | 发送 | `qqmail_send` | `{"to":"a@b.c","subject":"S","text":"B"}` |
 | 回复 | `qqmail_reply` | `{"uid":<uid>,"text":"B"}` |
 | 标记 | `qqmail_mark` | `{"uid":<uid>,"seen":true}` |
 | 移动 | `qqmail_move` | `{"uid":<uid>,"to":"<folder>"}` |
 | 删除 | `qqmail_delete` | `{"uid":<uid>}` |
 
-- 上表**最小参数集**以真调用成功的那次为准；**未验证**：各工具是否还有别的可选参数、`limit` 的默认值与上限——要确认就先调 `qqmail_config` / 看工具自带 schema，别凭记忆拼。
+- **`folder` 与 `query` 都是误记的旧参数名**——真实字段是 **`mailbox`**（不是 `folder`），搜索**没有 `query`**（按 `subject` / `from` / `body` / `text` 分腿过滤）。照旧名拼参数 = 参数校验报错，白跑一轮。
+- `qqmail_attachment` / `qqmail_send` / `qqmail_reply` 的**完整参数本轮未复核**，保持真调用成功过的那次写法；要确认就先看工具自带 schema，别凭记忆拼。
 - **只读模式只放 7 个**（少 `qqmail_send` / `qqmail_reply` / `qqmail_mark` / `qqmail_move` / `qqmail_delete`）。看到工具少 5 个 = 只读还开着（§3），不是接入失败。
 - 数字是**时刻值**：`qqmail_folders` 返回的 `INBOX(N 封/M 未读)`、`Sent Messages`、`Drafts`、`Junk`、`Deleted Messages` 与自定义子文件夹的计数每次都会变，**别当常量**。
 
@@ -96,31 +97,42 @@ icacls "C:\Users\admin\.dsh\.secrets\qqmail\config.json" /grant:r "$env:USERNAME
 
 ## 6. QQ IMAP 的可复用坑
 
-1. **层级分隔符是 `/`**（不是 `.`），`qqmail_move` 的 `to` 与 `qqmail_list` 的 `folder` 都按这个写。
-2. **非 ASCII 文件夹名是 modified UTF-7（RFC 3501）**——必须传**编码串**，**不是** UTF-8 / GBK：
-   - `其他文件夹` → `&UXZO1mWHTvZZOQ-`
-   - `其他文件夹/elysiumkaslana@outlook.com` → `&UXZO1mWHTvZZOQ-/elysiumkaslana@outlook.com`
-   - 症状：传 `其他文件夹` 原始中文 → 找不到文件夹 / 空结果。要拿准确编码串，**先调 `qqmail_folders` 让它自己回显**，别手算。
-3. **QQ 不要求先发 IMAP ID**：无 ID 直连 `login()`、先发 ID 再 `login()`、SELECT 路径**三条全成功**；网传的 `Unsafe Login` 本轮**未复现**。⇒ 见到 `Unsafe Login` 先怀疑授权码/ACL/端口，别急着照抄"必须先发 ID"的说法。
-4. **中文关键词搜索会退回本地窗口扫描**：返回里带 `mode:"local"` ⇒ 结论是"**最近约 N 封之内**"，**不是全库结论**。要么把窗口说清，要么改用 `qqmail_list` + 自己过滤，**不要把 local 结果说成"邮箱里没有这封邮件"**。
-5. **只读取证的铁律：FETCH 必须用 `BODY.PEEK[...]`**，用 `BODY[...]` 会把邮件**误标 `\Seen`**（等于偷偷改了用户的已读状态）。自证方法：抽样读几封后调 `qqmail_list` / 看返回的 `FLAGS ()` 仍为空即未被标记。
+1. **层级分隔符是 `/`**（不是 `.`），`qqmail_move` 的 `to` 与 `qqmail_list` 的 `mailbox` 都按这个写。
+2. **子文件夹的 uid 空间是独立的**：同一个 uid 数字在不同文件夹指**不同邮件**（实测归档夹 uid **32–39**，INBOX uid **582–619**）。⇒ 提到 uid **必须同时报文件夹**，只说 "uid 32" 无法定位。
+3. **非 ASCII 文件夹名直接传 UTF-8 原文**（**已被证伪的旧断言，直接改正**：旧版写"必须传 modified UTF-7 编码串"）——本 build 的 `qqmail_folders` **不回显 modified UTF-7**，照旧写法传编码串**两次都报错**：
+   - 可用：`其他文件夹` / `其他文件夹/elysiumkaslana@outlook.com`（中文原文，逐字传）
+   - 报错原文（传编码串时）：`Error: Command failed`（`&UXZO1mWHTvZZOQ-` 与 `&UXZO1mWHTvZZOQ-/…` 两次均如此）
+   - ⇒ 别手算 modified UTF-7；文件夹名以 `qqmail_folders` 的回显为准，**回显是什么就传什么**。
+4. **QQ 不要求先发 IMAP ID**：无 ID 直连 `login()`、先发 ID 再 `login()`、SELECT 路径**三条全成功**；网传的 `Unsafe Login` 本轮**未复现**。⇒ 见到 `Unsafe Login` 先怀疑授权码/ACL/端口，别急着照抄"必须先发 ID"的说法。
+5. **中文关键词搜索会退回本地窗口扫描**：返回里带 `mode:"local"` ⇒ 结论是"**最近约 N 封之内**"，**不是全库结论**。要么把窗口说清，要么改用 `qqmail_list` + 自己过滤，**不要把 local 结果说成"邮箱里没有这封邮件"**。
+6. **只读取证的铁律：FETCH 必须用 `BODY.PEEK[...]`**，用 `BODY[...]` 会把邮件**误标 `\Seen`**（等于偷偷改了用户的已读状态）。自证方法：抽样读几封后调 `qqmail_list` / 看返回的 `FLAGS ()` 仍为空即未被标记。
+7. **判"某词是否真在邮件里"用 `body:"单词"` 或 `subject:"词组"`，不要用 `text:` 多词全文查询**——`text:` 会返回"匹配 548 封"这种结果，看着像**没过滤**。并配**阳性对照做差分**：本例 `body:"annotations"` 命中 **37**、`body:"payments"` 命中 **0** ⇒ 差分把"没读到"变成"确实没有"。
+8. **拉失败邮件时间线用 `subject:"Run failed"` + `since` + `order:desc/asc`；`qqmail_list` 的首条常被无关邮件压在上面**（本例最新一条是 dependabot 评论，**不是**最新失败邮件）⇒ **别按 list 首条判"最新失败日期"**。
+9. **关键词腿只用 `since`：`before` 与 `from`/`subject` 同时出现 ⇒ 恒返回 0（静默假阴性）**。实测矩阵：`from+since+before` = **0**、`from+before` = **0**、`subject+since+before` = **0**；**去掉 `before` 后 `from+since` = 38**。⇒ 修法：**窗口上界人工按返回的时间列裁**，别用 `before` 收口。
+10. **`before` 是左闭右开**：要含 09-20 必须写 `before:"2024-09-21"`。自证法 = **前后各探一格**（`since:09-07 before:09-08` → 只返 09-07 的 1 封）。另：**`since` 偏宽约 1 天**（整窗会带回窗口前一天的信），属**多带**、不影响"有没有"的结论。
+11. **`from:` 只匹配发件人显示名，不匹配邮件地址**——阴性对照全 0：`from:"steampowered.com"` / `from:"steampowered"` / `from:"microsoft"` / `from:"outlook.com"`；阳性 `from:"steam"` = **47**（命中的显示名是 "Steam Support" / "Steam Team" / "Steam Store" / "Steam 客服"）。⇒ 搜 `from:"steampowered.com"` 得 0 **会直接误判成"Steam 没发过邮件"**；要按地址判发件人只能用 `to:` 侧思路或改抓显示名。
+12. **零命中判据：只认「匹配数 = 返回数」**。实测**静默丢条**：`qqmail_list {limit:200}` 只返 **196/200**；用 `since 2024-01-01 before 2024-06-01` 时报「匹配 **86** 封，返回 **85** 封」。⇒ 凡"匹配 ≠ 返回"，结论就**不能**写成"全库没有"。
+13. **必须枚举归档 / 其它文件夹，不能只看 INBOX**：实测 Steam 活动（客服案件、重置密码、新设备登录）落在「其他文件夹/<子文件夹名>」里而**不在 INBOX**；只看 INBOX 会漏判"无残留访问"。（配套事实见坑 2：子文件夹 uid 空间独立。）
+14. **时间对照：列表头时间是本地 UTC+8**（**已被证伪的旧断言，直接改正**：旧版说正文里的时间也是 UTC、只差 8 小时）——实测 **Steam 类收据正文里的时间是 Valve 太平洋时间 PDT(UTC-7)**，与列表头 UTC+8 **相差 15 小时**。证据：列表头 `2024-09-10 03:08` vs 正文 `Mon Sep 9 12:08` ⇒ 换算要按 **15 小时**，别按 8 小时。
+15. **"工具存在 ≠ 该用"**：即便 `readOnly=false`（写工具全在），也只调 `status` / `folders` / `list` / `read` / `search` 这**五个读工具**；`markSeen:false`（BODY.PEEK）生效可用「**读前后未读数不变**」自证（本例读前后均 **548 封 / 14 未读**）。
 
 ## 7. 不要做什么
 
 - **不要**用 `--read-only false`（陷阱 1）——要用 `--read-only=false` 或直改 JSON。
 - **不要**用 CLI 传 `--imap-port` / `--smtp-port`（陷阱 2）——直改 JSON 并回读复核。
-- **不要**手算 modified UTF-7，也别把中文原文当文件夹名传。
+- **不要**手算 modified UTF-7，也别把 UTF-7 编码串当文件夹名传（**直接传中文原文**，见 §6 坑 3）。
 - **不要**承诺草稿能力（§5），也不要用 `qqmail_send` 冒充草稿。
 - **不要**把 `qqmail_status` 的输出（含授权码前 4 位）原样转贴到公开位置。
-- **不要**把 `mode:"local"` 的搜索结果当全库结论（坑 4）。
-- **不要**放弃 `BODY.PEEK` 去"图省事"（坑 5）。
+- **不要**把 `mode:"local"` 的搜索结果当全库结论（坑 5）。
+- **不要**放弃 `BODY.PEEK` 去"图省事"（坑 6）。
+- **不要**把关键词腿和 `before` 一起用（恒返 0 的静默假阴性，坑 9）；**不要**用 `from:"<邮件地址>"` 判发件人（只匹配显示名，坑 11）；**不要**在"匹配 ≠ 返回"时断言"全库没有"（坑 12）；**不要**只看 INBOX 就下"无残留访问"的结论（坑 13）。
 - **不要**发不带 【AI 代发】前缀的邮件（§4）。
 
 ## 8. 验收标准
 
 1. `mcp__qqmail__qqmail_status` 返回账户信息 + `readOnly` 当前值 ⇒ 链路与授权码都活着（注意它回显授权码前 4 位）。
-2. `qqmail_folders` 返回文件夹清单且自定义中文文件夹是 **UTF-7 编码串**形态 ⇒ 编码这一关是对的。
-3. 只读四连：`qqmail_folders` → `qqmail_list`（`{"folder":"INBOX","limit":10}`）→ `qqmail_read`（某个 `uid`）→ `qqmail_attachment`。做完 `FLAGS` 仍为空 ⇒ `BODY.PEEK` 生效、没有污染已读状态。
+2. `qqmail_folders` 返回文件夹清单，且**中文夹名以 UTF-8 原文**（如 `其他文件夹/elysiumkaslana@outlook.com`）直接可传给 `mailbox` ⇒ 编码这一关是对的（**别传 modified UTF-7 编码串**，§6 坑 3）。
+3. 只读四连：`qqmail_folders` → `qqmail_list`（`{"mailbox":"INBOX","limit":10}`）→ `qqmail_read`（某个 `uid`）→ `qqmail_attachment`。做完 `FLAGS` 仍为空 ⇒ `BODY.PEEK` 生效、没有污染已读状态。**报 uid 时一并写清 mailbox**（子文件夹 uid 空间独立，§6 坑 2）
 4. 写操作：工具**存在**（说明只读已关）+ 用户已确认摘要 + 正文首行是 `【AI 代发】`。
 5. 想改配置时：改完用 `qqmail_config` 读回，确认 `imapPort: 993` / `smtpPort: 465` 是**数字**而不是 `0`。
 
